@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sienge": {
+      "command": "sienge-ecbiesek-mcp",
+      "args": []
+    }
+  }
+}
