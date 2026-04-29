@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "sienge": {
-      "command": "sienge-ecbiesek-mcp",
-      "args": []
+      "command": "sh",
+      "args": [
+        "-c",
+        "set -a && . /home/user/Code/.env && exec sienge-ecbiesek-mcp"
+      ]
     }
   }
 }
