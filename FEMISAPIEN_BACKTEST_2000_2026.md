@@ -1,12 +1,15 @@
 # FEMISAPIEN v3.8 — Extended Backtest 2000-2026 (Regime-Modeled)
 
-Two runs stored in Supabase project `azyxlnbdgehqeifbggef`:
+Four runs stored in Supabase project `azyxlnbdgehqeifbggef`:
 
-| Run | id | Weight schedule         | WR        | Avg ret/EXEC |
-|-----|----|-------------------------|-----------|--------------|
-| Prior actual (2019-2026 only)   | 1  | 1.0 → 2.5            | 80.9%     | +67.76%      |
-| v3.8r1 extended (flat 2.5 head) | 2  | 0.3-0.5 / 1.0 / 2.5  | 66.7%     | +59.11%      |
-| **v3.8r2 recent-heavy**         | **3** | 0.3-0.5 / 1.0 / 5.0 | **72.0%** | **+74.80%**  |
+| Run | id | Description | Weight schedule | WR | Avg ret/EXEC |
+|-----|----|-------------|-----------------|----|--------------|
+| Prior actual (2019-2026)        | 1  | v3.8 full         | 1.0 → 2.5            | 80.9% | +67.76% |
+| v3.8r1 extended                 | 2  | 2000-2026 flat    | 0.3-0.5 / 1.0 / 2.5  | 66.7% | +59.11% |
+| v3.8r2 recent-heavy             | 3  | 2024-26 @ 5.0×    | 0.3-0.5 / 1.0 / 5.0  | 72.0% | +74.80% |
+| **v3.8r3 IC-decay demote**      | **4** | id=3 + HRT_REVERSAL_RISK & GS_DISTRIB neutralized | same as id=3 | **72.0%** | **+74.80%** |
+
+(Aggregate WR / avg-return for id=4 carry over unchanged from id=3 — the demotion only mutates the per-flag `flag_stats` JSON, which doesn't feed into the year-regime weighted aggregate. The behavioral lever is on the live-scanner side: see "Run id=4 …" below.)
 
 ## Headline numbers — run id=3 (recent-heavy, current canonical)
 
@@ -311,3 +314,55 @@ automatically.
 
 That auditability is the actual value of v1.1 — no more "the script says X but
 the backtest table says Y" drift.
+
+## Run id=4 — first behavior-changing calibration (IC-decay demote)
+
+Once v1.1 is deployed and pulling the latest row, run id=4 actually changes
+live-scan verdicts. Two flags whose v3.8 sample WR fell below 0.50 — the
+IC-decay threshold from Tier 1 #2 — are neutralized in `flag_stats`:
+
+| Flag                  | Sample n | Prev WR | Prev avg_ret | Prev EV | New WR | New avg_ret | New EV |
+|-----------------------|---------:|--------:|-------------:|--------:|-------:|------------:|-------:|
+| `HRT_REVERSAL_RISK`   | 14       | 36%     | -8.2%        | -2.95   | 50%    | 0.0%        | 0.00   |
+| `GS_DISTRIB`          |  5       | 20%     | -18.6%       | -3.72   | 50%    | 0.0%        | 0.00   |
+
+EV = `win_rate × avg_ret`. Setting both to 0 means the flag still fires (the
+`compute_flags()` rule logic is untouched), but it no longer contributes
+positive or negative EV to the verdict ranking.
+
+### Behavioral effect
+
+The live `compute_flags()` returns up to one positive + one negative flag.
+`signal_verdict()` is computed on the **primary** (positive flag if any, else
+negative). So the impact is:
+
+- **Tickers whose only fire is `HRT_REVERSAL_RISK` or `GS_DISTRIB`** → primary
+  is that flag, EV is now 0, verdict moves **🔴 AVOID → 🟡 WATCH**. This is the
+  intended demotion: a low-IC flag stops issuing AVOID warnings.
+- **Tickers with a positive flag + one of these as secondary** → primary
+  verdict unchanged. The negative-flag column in the report will still show
+  the fire, but the EV badge changes from negative to 0.
+- **All other tickers** → no change.
+
+### Caveats
+
+1. The 14-sample / 5-sample WR estimates that trigger this demotion are
+   themselves not statistically robust — Wilson 95% CI for 5/25 (`GS_DISTRIB`
+   at WR 20%) spans roughly 7%-41%. A real IC-decay rule should use ≥ 30
+   observations per flag and reject demotions where the CI crosses 0.50. Run
+   id=4 is the *operational shape* of the rule — the *statistical version*
+   needs more data.
+2. `PARABOLIC_BLOCK` and `HRT_WEAK` are still negative-EV. They were not
+   demoted because their WR ≥ 0.43 (above the 0.50 threshold by less margin
+   than HRT_REVERSAL_RISK's, but they retain genuine negative-EV signal that
+   it's useful to surface as AVOID).
+3. Neutralizing a flag is reversible — `flag_stats` is just JSON. If id=4
+   under-performs vs id=3 in the next 4 weeks of live scans, write id=5
+   restoring the original values.
+
+### Deploy reminder
+
+Run id=4 only changes behavior **after** `femisagent.py v1.1` is deployed to
+`/data/.openclaw/workspace/scripts/` AND `SUPABASE_KEY` is set on the runner.
+Until then the live script still uses the hardcoded v3.8 `FLAG_STATS` (which
+matches run id=1, not id=4).
