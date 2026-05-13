@@ -246,3 +246,68 @@ as much as raw WR. Each is tagged by the desk most associated with it.
 | P2 | #3 cross-sectional ranking | Requires re-fitting all thresholds. |
 | P2 | #6 #7 options/IV filter | Needs IV/skew feed from the prior pricing entitlement. |
 | P3 | #8-11 alt-data + execution | Largest lift but biggest data/infra cost. |
+
+## Wiring the live scanner to Supabase (femisagent.py v1.1)
+
+The live `femisagent.py` script (workspace-runner, path
+`/data/.openclaw/workspace/scripts/femisagent.py`) previously had **hardcoded
+flag stats** — it never read the backtest table, so new Supabase runs (id=2,
+id=3) did not change live scan behavior.
+
+This branch adds a patched `femisagent.py` (in the repo root) that hot-loads
+the newest `femisapien_backtest_runs` row on every invocation, with offline
+cache fallback. Changes vs the original:
+
+- New `load_latest_calibration()` called at `__main__`. Pulls
+  `?select=id,version,flag_stats,weighted_win_rate,weighted_avg_return_pct&order=id.desc&limit=1`
+  from `https://azyxlnbdgehqeifbggef.supabase.co/rest/v1/femisapien_backtest_runs`.
+- Caches the result to
+  `/data/.openclaw/workspace/memory/femisagent_flag_stats.cache.json`.
+- Fallback chain: Supabase → cache → hardcoded v3.8 defaults.
+- Report header now prints `Calibration: supabase-run-id=N` (or `cache-…` /
+  `hardcoded-…`) so the scan output is auditable.
+- `femisagent_last_run.json` gets a new `calibration_source` field.
+- Bumped header version `v1.0 → v1.1`.
+
+### Deploy (one-time, by the operator)
+
+```bash
+# 1. Copy the patched script onto the bridge server
+scp femisagent.py bridge:/data/.openclaw/workspace/scripts/femisagent.py
+
+# 2. Set the Supabase env vars on the runner
+#    Choose ONE of:
+#    a) Anon key + a SELECT policy on the table (see migration below)
+#    b) Service-role key (bypasses RLS — fine for a server-side script)
+export SUPABASE_URL=https://azyxlnbdgehqeifbggef.supabase.co
+export SUPABASE_KEY=<anon-or-service-role-key>
+
+# 3. Smoke test
+python3 /data/.openclaw/workspace/scripts/femisagent.py --tickers NVDA AMD
+# Expect first log line:
+# [femisagent] Calibration loaded from Supabase: run id=3 | FEMISAPIEN v3.8r2 — Recent-Heavy …
+```
+
+If you go the anon-key route, this migration adds the minimal read policy:
+
+```sql
+ALTER TABLE public.femisapien_backtest_runs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "anon read backtest runs"
+  ON public.femisapien_backtest_runs
+  FOR SELECT
+  TO anon
+  USING (true);
+```
+
+### What changes in live signal output
+
+Today the table column `flag_stats` is identical across run id=1, id=2, id=3 —
+because runs 2 and 3 were aggregate reweights, not per-flag recalibrations. So
+the v1.1 script with current data will produce **the same EV / EXECUTE / BUY /
+WATCH verdicts** as v1.0, but the report header will document which Supabase
+row drove the scan, and the next time anyone calibrates a new per-flag table
+(FIX-12+, walk-forward CV, IC-decay demotion) the live scanner picks it up
+automatically.
+
+That auditability is the actual value of v1.1 — no more "the script says X but
+the backtest table says Y" drift.
