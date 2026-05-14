@@ -366,3 +366,145 @@ Run id=4 only changes behavior **after** `femisagent.py v1.1` is deployed to
 `/data/.openclaw/workspace/scripts/` AND `SUPABASE_KEY` is set on the runner.
 Until then the live script still uses the hardcoded v3.8 `FLAG_STATS` (which
 matches run id=1, not id=4).
+
+## Run id=5 — Wilson-CI statistical demote
+
+Run id=4 was the *operational shape* of an IC-decay rule (manually picked two
+small-sample flags). Run id=5 is the *statistical version*: a uniform Wilson-CI
+filter applied to id=4's `flag_stats`.
+
+**Rule:** neutralize any flag with `n < 10` **OR** Wilson 95% lower bound
+of `win_rate` `< 0.5`.
+
+**Result:** 5 new demotions on top of id=4's 2 (total 7 neutralized out of 13).
+
+| Flag | n | WR | Reason for demote |
+|---|---:|---:|---|
+| `GS_ACCUM`        |  4 | 85% | n<10 |
+| `SQUEEZE_EXTREME` |  6 | 100% | n<10 |
+| `GS_MILD_ACCUM`   |  8 | 75% | n<10 |
+| `PARABOLIC_BLOCK` |  9 | 44% | n<10 |
+| `HRT_WEAK`        |  7 | 43% | n<10 |
+| (carried from id=4: `HRT_REVERSAL_RISK`, `GS_DISTRIB`) | | | manual IC-decay |
+
+All 5 newly demoted flags fail purely on the n<10 threshold. None of the
+remaining flags (n=10..43) fail Wilson_lower<0.5 — their CIs are tight
+enough.
+
+**Behavioral impact (verified live):**
+
+- 🟢 EXECUTE bucket (EV ≥ 80) → **empty**. Top remaining is `20D_BREAKOUT`
+  at EV=69, which lands in 🟢 BUY.
+- Top-EV flags going forward: `20D_BREAKOUT` (69) > `MOMENTUM_SURGE` (51) >
+  `VPIN_ELEVATED` (48) > `MOMENTUM_CONTINUATION` (41) > `HRT_STRONG` (37) >
+  `VPIN_TOXIC` (32). All BUY-tier.
+- `🔴 AVOID` only fires when no positive flag is present. With
+  `PARABOLIC_BLOCK` and `HRT_WEAK` neutralized, the only remaining negative-
+  EV flag is... none. So AVOID becomes effectively unreachable in the live
+  scanner under id=5.
+
+This is intentionally conservative — the statistically defensible answer
+with current sample sizes. The right next step is to produce **n ≥ 30 per
+flag** via a longer backtest with more universe diversity, which is what
+the auto-backtest pipeline below is for.
+
+## Auto-backtest pipeline — `femisagent_backtest.py`
+
+Until id=5, every `femisapien_backtest_runs` row was hand-written by SQL
+in this session. The new `femisagent_backtest.py` script (in the repo root
+on this branch) ends that pattern: it pulls historical bars via yfinance,
+applies `compute_flags()` over rolling windows, measures forward N-day
+returns per flag fire, and POSTs a new row to Supabase. The live scanner
+picks it up on the next scan via the v1.1+ `load_latest_calibration()`.
+
+### What it does
+
+1. `yf.download(tickers, start, end, auto_adjust=True)` — split/dividend-
+   adjusted daily bars from yfinance. Free, no auth, rate-limit-tolerant.
+2. For each ticker with sufficient history (≥ `lookback + horizon + 5`
+   bars), slide a window of length `--lookback` (default 90 bars).
+3. At each window endpoint, call `compute_flags(window)`. For every flag
+   fire that's not `NEUTRAL` / `INSUFFICIENT_DATA`, record the forward
+   `--horizon`-trading-day price change (default 60td).
+4. Aggregate per-flag `{n, win_rate_pct, avg_ret_pct}`.
+5. (Default on) apply Wilson-CI demote: same rule as id=5 above.
+   `--no-wilson` skips this; raw stats then land in Supabase.
+6. POST to `femisapien_backtest_runs`. Returns the new `id`.
+
+### Key flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--start` / `--end` | 5y ago → today | Backtest window. |
+| `--horizon` | 60 | Forward return horizon (trading days). |
+| `--lookback` | 90 | Bars window fed to `compute_flags`. |
+| `--tickers ...` | watchlist of 49 | Universe override. |
+| `--no-wilson` | off | Disable demote; ship raw stats. |
+| `--min-n` | 10 | n threshold for Wilson demote. |
+| `--min-wilson-lower` | 0.5 | Wilson lower-bound threshold. |
+| `--dry-run` | off | Compute + print, don't POST. |
+| `--version-tag` | auto | Override the `version` field. |
+
+### Deploy
+
+```bash
+# On the bridge:
+pip3 install --break-system-packages yfinance
+
+# Deploy femisagent_backtest.py to /data/.openclaw/workspace/scripts/
+#   — use the same base64 heredoc pattern as femisagent.py v1.1 deploy.
+# Also redeploy femisagent.py v1.2 (lazy ib_insync import + KeyError fix);
+#   v1.2 is required so the backtest can import compute_flags without
+#   pulling in ib_insync.
+
+# Add femisagent_backtest.py to the bridge's run_script allow-list (the
+# server.py source on the bridge — wherever the allow-list of 3 scripts
+# is defined: femisagent.py, femisagent_daily.py, morning_brief.py).
+# Then restart: systemctl restart jarvis-bridge
+```
+
+### Smoke test (dry-run, no Supabase write)
+
+```bash
+python3 /data/.openclaw/workspace/scripts/femisagent_backtest.py \
+  --tickers NVDA AMD TSLA \
+  --start 2022-01-01 --end 2024-12-31 \
+  --horizon 30 \
+  --dry-run
+```
+
+Expected: per-flag stats table, Wilson-demote summary, then a payload
+preview (NOT the full `flag_stats` JSON — too noisy; preview shows counts
+and metadata keys).
+
+### Full run → ships a new Supabase row
+
+```bash
+python3 /data/.openclaw/workspace/scripts/femisagent_backtest.py
+# default: full watchlist, last 5y, h=60, Wilson-CI on
+# → POSTs to femisapien_backtest_runs, prints new id
+# → next femisagent.py scan shows "Calibration: supabase-run-id=<new>"
+```
+
+### Caveats & known gotchas
+
+- **yfinance reliability**: Yahoo periodically changes their internal API;
+  yfinance has historically broken with no notice. If `yf.download` returns
+  empty for everything, `pip install --upgrade yfinance`.
+- **Survivorship bias**: the default watchlist is the current universe.
+  Tickers that delisted before today (or got acquired) aren't in it, so
+  the backtest is mildly biased toward survivors. Mitigation: feed
+  `--tickers` from a historical S&P 500 / Russell 1000 list.
+- **Forward-return horizon ≠ v3.8's original**: the existing FLAG_STATS
+  in id=1 had avg_ret values up to +123% (GS_ACCUM). That suggests the
+  original v3.8 calibration used a long horizon (252+td) or only counted
+  big winners. This script's defaults (60td, all fires equally weighted)
+  will produce more modest numbers — they are not directly comparable to
+  id=1. Use `--horizon 252` if you want closer matching.
+- **No look-ahead, but no transaction costs either**: bars at index `i`
+  are used to fire the signal, bars at `i + horizon` for the forward
+  return. No bias. But also no slippage, commission, or borrow costs
+  modeled. Real-world execution will trail.
+- **flag_stats aggregate via REST**: this script writes the new row
+  through Supabase REST (using the service-role key or anon-with-policy).
+  RLS is enforced by Supabase; nothing changes there.

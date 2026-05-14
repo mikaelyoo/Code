@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.1 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.2 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
-v1.1 change: FLAG_STATS now hot-loaded from Supabase
-public.femisapien_backtest_runs on startup (newest row), with offline cache
-fallback. Set SUPABASE_URL + SUPABASE_KEY env vars to enable. Without them
-the hardcoded v3.8 defaults are used.
+v1.1: FLAG_STATS hot-loaded from Supabase public.femisapien_backtest_runs
+on startup (newest row), with offline cache fallback. Set SUPABASE_URL +
+SUPABASE_KEY env vars to enable.
+
+v1.2: ib_insync import made lazy (deferred into fetch_bars / run) so
+compute_flags() can be imported by femisagent_backtest.py without dragging
+in the IBKR client. Also fixes print_report() KeyError when SKIP-bucket
+rows lack price/ret_20d_pct/vol_ratio fields.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
 from datetime import datetime, timedelta
-from ib_insync import IB, Stock, util
 
 # ── Config ─────────────────────────────────────────────────────────────────
 IBKR_HOST = os.environ.get("IBKR_HOST", "100.102.101.103")
@@ -286,6 +289,7 @@ async def fetch_bars(ib, ticker, exchange="SMART", currency="USD"):
         raw = fetch_bars_via_bridge(ticker)
         if raw:
             return [make_bar_obj(d) for d in raw]
+    from ib_insync import Stock
     contract = Stock(ticker, exchange, currency)
     try:
         await ib.qualifyContractsAsync(contract)
@@ -310,6 +314,7 @@ async def get_portfolio_tickers(ib):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 async def run(tickers=None, portfolio_mode=False):
+    from ib_insync import IB
     ib = IB()
     if USE_BRIDGE and BRIDGE_TOKEN:
         print(f"Using Jarvis bridge at {BRIDGE_URL} for market data (no direct IBKR connection)")
@@ -383,7 +388,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.1 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -406,8 +411,11 @@ def print_report(results):
             if "qty" in r:
                 pos_info = f" | pos={r['qty']} @ ${r['avg_cost']} ({r['unreal_pct']:+.1f}%)"
             flag2 = f" +{r['flag2']}" if r.get("flag2") else ""
-            print(f"  {r['symbol']:<8} ${r['price']:<8.2f} {r['ret_20d_pct']:+6.1f}% 20d | "
-                  f"vol={r['vol_ratio']:.1f}x | {r['flag']}{flag2}{pos_info}")
+            if "price" in r:
+                print(f"  {r['symbol']:<8} ${r['price']:<8.2f} {r['ret_20d_pct']:+6.1f}% 20d | "
+                      f"vol={r['vol_ratio']:.1f}x | {r['flag']}{flag2}{pos_info}")
+            else:
+                print(f"  {r['symbol']:<8} {r['flag']}{flag2}{pos_info}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
