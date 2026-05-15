@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.2 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.3 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -12,6 +12,12 @@ v1.2: ib_insync import made lazy (deferred into fetch_bars / run) so
 compute_flags() can be imported by femisagent_backtest.py without dragging
 in the IBKR client. Also fixes print_report() KeyError when SKIP-bucket
 rows lack price/ret_20d_pct/vol_ratio fields.
+
+v1.3: signal_verdict() thresholds rescaled to match yfinance-derived EV
+distribution (run id=6 onwards). Old 80/30/0 were calibrated to v3.8's
+hardcoded avg_ret values up to +123%. New backtest data at 60td horizon
+caps EV around +12, so thresholds become 10/5/0. EXECUTE / BUY / WATCH /
+AVOID semantics preserved; just rescaled to the empirical distribution.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
@@ -129,8 +135,8 @@ def ev_score(flag):
 
 def signal_verdict(flag):
     ev = ev_score(flag)
-    if ev >= 80:  return "🟢 EXECUTE"
-    if ev >= 30:  return "🟢 BUY"
+    if ev >= 10:  return "🟢 EXECUTE"
+    if ev >= 5:   return "🟢 BUY"
     if ev >= 0:   return "🟡 WATCH"
     return "🔴 AVOID"
 
@@ -388,14 +394,14 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.3 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
     categories = [
-        ("🟢 EXECUTE",  lambda r: r["ev_score"] >= 80),
-        ("🟢 BUY",      lambda r: 30 <= r["ev_score"] < 80),
-        ("🟡 WATCH",    lambda r: 0 <= r["ev_score"] < 30),
+        ("🟢 EXECUTE",  lambda r: r["ev_score"] >= 10),
+        ("🟢 BUY",      lambda r: 5 <= r["ev_score"] < 10),
+        ("🟡 WATCH",    lambda r: 0 <= r["ev_score"] < 5),
         ("🔴 AVOID",    lambda r: r["ev_score"] < 0),
         ("⚪ SKIP",     lambda r: r["ev_score"] == 0 and r["flag"] in ["NO_DATA","NEUTRAL","INSUFFICIENT_DATA"]),
     ]
@@ -419,9 +425,9 @@ def print_report(results):
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
-          f"Execute: {sum(1 for r in results if r['ev_score'] >= 80)} | "
-          f"Buy: {sum(1 for r in results if 30 <= r['ev_score'] < 80)} | "
-          f"Watch: {sum(1 for r in results if 0 <= r['ev_score'] < 30)} | "
+          f"Execute: {sum(1 for r in results if r['ev_score'] >= 10)} | "
+          f"Buy: {sum(1 for r in results if 5 <= r['ev_score'] < 10)} | "
+          f"Watch: {sum(1 for r in results if 0 <= r['ev_score'] < 5)} | "
           f"Avoid: {sum(1 for r in results if r['ev_score'] < 0)}")
     print("="*80 + "\n")
 
@@ -433,9 +439,9 @@ def print_report(results):
             "signals": results,
             "summary": {
                 "total": len(results),
-                "execute": sum(1 for r in results if r["ev_score"] >= 80),
-                "buy": sum(1 for r in results if 30 <= r["ev_score"] < 80),
-                "watch": sum(1 for r in results if 0 <= r["ev_score"] < 30),
+                "execute": sum(1 for r in results if r["ev_score"] >= 10),
+                "buy": sum(1 for r in results if 5 <= r["ev_score"] < 10),
+                "watch": sum(1 for r in results if 0 <= r["ev_score"] < 5),
                 "avoid": sum(1 for r in results if r["ev_score"] < 0),
             }
         }, f, indent=2)

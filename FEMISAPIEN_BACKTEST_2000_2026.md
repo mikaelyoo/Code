@@ -508,3 +508,84 @@ python3 /data/.openclaw/workspace/scripts/femisagent_backtest.py
 - **flag_stats aggregate via REST**: this script writes the new row
   through Supabase REST (using the service-role key or anon-with-policy).
   RLS is enforced by Supabase; nothing changes there.
+
+## Run id=6 — first yfinance auto-backtest, and what it revealed
+
+Run id=6 = full 49-ticker watchlist, 2021-05-16 → 2026-05-15, h=60td,
+Wilson-CI on. Live-verified: agent now reports `Calibration:
+supabase-run-id=6`.
+
+But the result surfaced two structural issues that motivate v1.3 / v1.1
+of this branch:
+
+### Issue 1: EV scale shift
+
+| Source | Top EV | BUY threshold (EV≥30) | EXECUTE threshold (EV≥80) |
+|---|---:|---:|---:|
+| v3.8 hardcoded (run id=1) | +115 (SQUEEZE_EXTREME)  | 6 flags | 2 flags |
+| Run id=6 (yfinance, 60td) | **+12** (HRT_WEAK)      | 0 flags | 0 flags |
+
+The v3.8 hardcoded `avg_ret` values (up to +123%) clearly came from a
+much longer horizon or a "big winners only" sample. With 60td forward
+returns on a 5y window, real EV magnitudes cap at ~+12. The original
+80/30/0 thresholds were calibrated to v3.8's scale and don't transfer.
+
+**femisagent.py v1.3** rescales `signal_verdict` thresholds to match the
+empirical distribution:
+
+| Tier | Old threshold | New threshold |
+|---|---:|---:|
+| 🟢 EXECUTE | EV ≥ 80 | EV ≥ 10 |
+| 🟢 BUY     | EV ≥ 30 | EV ≥ 5  |
+| 🟡 WATCH   | EV ≥ 0  | EV ≥ 0  |
+| 🔴 AVOID   | EV < 0  | EV < 0  |
+
+Ratios kept similar (80/30 ≈ 2.67×, 10/5 = 2.0×) so the tier semantics
+are preserved. Top-EV flags re-enter the EXECUTE bucket; mid-tier into
+BUY; small-EV into WATCH.
+
+### Issue 2: "warning flag" sign flip — base-rate artifact?
+
+Four flags that v3.8 hardcoded as **negative-EV warnings** —
+`HRT_WEAK`, `HRT_REVERSAL_RISK`, `PARABOLIC_BLOCK`, `GS_DISTRIB` — all
+showed **positive forward returns** in run id=6. Suspicious. Three
+hypotheses:
+
+1. **Universe / period base rate**: the 49-ticker momentum/tech/crypto
+   watchlist over 2021-2026 was a strong bull market. The unconditional
+   60d forward return for a random entry might be +12-15%, so any
+   triggered flag with avg_ret +10% is actually *underperforming the
+   baseline*.
+2. **Survivorship bias**: the watchlist is today's universe. Stocks
+   that fired these warning flags AND went bankrupt aren't in the
+   sample.
+3. **Definition drift**: v3.8's labels might have used a different
+   horizon, win definition, or sample.
+
+**femisagent_backtest.py v1.1** addresses hypothesis 1 by computing the
+**unconditional baseline**: average forward return across ALL (i, i+h)
+windows, regardless of flag fire. Then for each flag, computes
+`excess_ret_pct = avg_ret_pct - baseline_ret_pct` and `excess_wr_pct`.
+A flag's actual edge is its excess, not its raw return. Baseline lives
+in `raw_metadata.baseline_unconditional`; per-flag excess metrics live
+in each `flag_stats` array entry. The live scanner still scores on raw
+`win_rate × avg_ret` (so deploy doesn't change live behavior); the
+excess metrics are diagnostic for the next calibration decision.
+
+Also fixed in v1.1: the `datetime.utcnow()` deprecation warning that
+was appearing on every run.
+
+### Deploy v1.3 + v1.1
+
+Same base64-heredoc pattern as before. After redeploy, re-run the full
+backtest to ship run id=7 with baseline data attached. Then inspect
+`raw_metadata.baseline_unconditional` and the new `excess_ret_pct` /
+`excess_wr_pct` fields to confirm hypothesis 1.
+
+If the baseline analysis shows excess_ret is ~0 or negative for the
+sign-flipped flags, the next calibration version should either:
+(a) score on excess EV instead of raw EV in `compute_flags`'s sort, or
+(b) use a benchmark-relative win rate (`P(ret > baseline)` instead of
+`P(ret > 0)`), or
+(c) source a less universe-biased sample (e.g., a historical S&P 500
+universe with delisted constituents included).

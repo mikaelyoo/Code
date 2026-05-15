@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT_BACKTEST v1.0 — yfinance-based historical backtest → Supabase.
+FEMISAGENT_BACKTEST v1.1 — yfinance-based historical backtest → Supabase.
 
 Pulls daily bars via yfinance for a watchlist over a date range, slides
 compute_flags() (imported from femisagent.py) across each ticker's history,
 records forward N-trading-day returns per flag fire, aggregates per-flag
 {n, win_rate_pct, avg_ret_pct}, optionally applies a Wilson-CI demote
 rule, then POSTs the result as a new row in public.femisapien_backtest_runs.
+
+v1.1: also computes the *unconditional* baseline (avg forward N-day return +
+win-rate across ALL (i, i+N) windows, not conditional on any flag firing).
+Each flag's stats now include excess_ret_pct = avg_ret_pct - baseline_ret_pct
+and excess_wr_pct = win_rate_pct - baseline_win_rate_pct. This is the proper
+"does the flag actually carry information?" metric — a flag with raw avg_ret
++10% on a universe whose unconditional 60d return is also +10% has zero
+edge; only excess matters. The raw avg_ret_pct is preserved in the flag_stats
+JSON (which femisagent.py reads), so live scanner behavior is unchanged. The
+baseline lives in raw_metadata.
 
 The live femisagent.py v1.1+ picks up the newest row on its next scan
 (load_latest_calibration), so the pipeline is: run this → next scan uses
@@ -27,7 +37,7 @@ import math
 import os
 import sys
 import urllib.request as _urllib_req
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from femisagent import compute_flags
 
@@ -98,9 +108,12 @@ def _df_to_bars(sub):
 def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90):
     """For each ticker, slide a window, compute flags, measure forward returns.
 
-    Returns {flag: {"n": int, "win_rate_pct": float, "avg_ret_pct": float}}.
+    Returns (stats, fires_per_ticker, baseline) where:
+        stats     = {flag: {n, win_rate_pct, avg_ret_pct, excess_ret_pct, excess_wr_pct}}
+        baseline  = {n, win_rate_pct, avg_ret_pct}  # unconditional forward return
     """
     flag_returns = {}
+    all_window_returns = []
     fires_per_ticker = {}
     for sym, bars in bars_by_ticker.items():
         if len(bars) < lookback_bars + horizon_days + 5:
@@ -112,11 +125,23 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90):
             entry = bars[i].close
             future = bars[i + horizon_days].close
             ret = (future / entry - 1) * 100.0
+            all_window_returns.append(ret)
             for flag in flags:
                 if flag in ("NEUTRAL", "INSUFFICIENT_DATA", "NO_DATA"):
                     continue
                 flag_returns.setdefault(flag, []).append(ret)
                 fires_per_ticker[sym] += 1
+
+    n_baseline = len(all_window_returns)
+    if n_baseline > 0:
+        wins_baseline = sum(1 for r in all_window_returns if r > 0)
+        baseline = {
+            "n": n_baseline,
+            "win_rate_pct": round(wins_baseline / n_baseline * 100.0, 1),
+            "avg_ret_pct": round(sum(all_window_returns) / n_baseline, 2),
+        }
+    else:
+        baseline = {"n": 0, "win_rate_pct": 0.0, "avg_ret_pct": 0.0}
 
     stats = {}
     for flag, rets in flag_returns.items():
@@ -124,12 +149,16 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90):
         if n == 0:
             continue
         wins = sum(1 for r in rets if r > 0)
+        wr_pct = round(wins / n * 100.0, 1)
+        avg_ret = round(sum(rets) / n, 2)
         stats[flag] = {
             "n": n,
-            "win_rate_pct": round(wins / n * 100.0, 1),
-            "avg_ret_pct": round(sum(rets) / n, 2),
+            "win_rate_pct": wr_pct,
+            "avg_ret_pct": avg_ret,
+            "excess_ret_pct": round(avg_ret - baseline["avg_ret_pct"], 2),
+            "excess_wr_pct": round(wr_pct - baseline["win_rate_pct"], 1),
         }
-    return stats, fires_per_ticker
+    return stats, fires_per_ticker, baseline
 
 
 def wilson_lower(p, n, z=1.96):
@@ -166,7 +195,7 @@ def apply_wilson_demote(stats, min_n=10, min_wilson_lower=0.5, z=1.96):
     return demoted
 
 
-def build_payload(version_tag, period_label, universe, stats, demoted, args):
+def build_payload(version_tag, period_label, universe, stats, demoted, args, baseline=None):
     """Build the femisapien_backtest_runs row body."""
     items = sorted(
         stats.items(),
@@ -179,6 +208,8 @@ def build_payload(version_tag, period_label, universe, stats, demoted, args):
             "n": s["n"],
             "win_rate_pct": s["win_rate_pct"],
             "avg_ret_pct": s["avg_ret_pct"],
+            "excess_ret_pct": s.get("excess_ret_pct"),
+            "excess_wr_pct": s.get("excess_wr_pct"),
             "priority": i,
         }
         for i, (flag, s) in enumerate(items, 1)
@@ -223,7 +254,8 @@ def build_payload(version_tag, period_label, universe, stats, demoted, args):
             "wilson_min_lower": args.min_wilson_lower,
             "demoted_flags": demoted,
             "universe_full_list": list(universe),
-            "ran_at_utc": datetime.utcnow().isoformat() + "Z",
+            "baseline_unconditional": baseline or {},
+            "ran_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
         "notes": (
             f"Auto-backtest. Period {period_label}. Universe {len(universe)} tickers. "
@@ -289,10 +321,17 @@ def main():
     ok_tickers = [t for t, b in bars.items() if b]
     print(f"[backtest] Got bars for {len(ok_tickers)}/{len(args.tickers)} tickers")
 
-    stats, fires_per_ticker = run_backtest(
+    stats, fires_per_ticker, baseline = run_backtest(
         bars, horizon_days=args.horizon, lookback_bars=args.lookback
     )
-    print(f"[backtest] Per-flag stats:")
+    print(
+        f"[backtest] Unconditional baseline: "
+        f"n={baseline['n']} "
+        f"WR={baseline['win_rate_pct']:.1f}% "
+        f"avg_ret={baseline['avg_ret_pct']:+.2f}% "
+        f"(coin-flip entry, same universe, same horizon)"
+    )
+    print(f"[backtest] Per-flag stats (excess = vs baseline):")
     sorted_items = sorted(
         stats.items(),
         key=lambda kv: -(kv[1]["win_rate_pct"] / 100.0) * kv[1]["avg_ret_pct"],
@@ -303,7 +342,9 @@ def main():
             f"  {flag:<28} n={s['n']:<5} "
             f"WR={s['win_rate_pct']:>5.1f}% "
             f"avg_ret={s['avg_ret_pct']:>+7.2f}% "
-            f"EV={ev:>+7.2f}"
+            f"EV={ev:>+7.2f}  | "
+            f"excess_ret={s['excess_ret_pct']:>+6.2f}% "
+            f"excess_wr={s['excess_wr_pct']:>+5.1f}%"
         )
 
     demoted = []
@@ -319,7 +360,7 @@ def main():
                     f"prev_WR={d['prev_wr_pct']:>5.1f}% prev_avg_ret={d['prev_avg_ret_pct']:>+7.2f}%"
                 )
 
-    payload = build_payload(args.version_tag, period_label, args.tickers, stats, demoted, args)
+    payload = build_payload(args.version_tag, period_label, args.tickers, stats, demoted, args, baseline=baseline)
 
     if args.dry_run:
         print("[backtest] --dry-run: not POSTing to Supabase. Payload preview:")
