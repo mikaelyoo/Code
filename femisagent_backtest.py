@@ -64,6 +64,7 @@ class Bar:
 def fetch_yf_bars(tickers, start, end):
     """Returns {ticker: [Bar, ...]} oldest-first. Skips tickers with no data."""
     import yfinance as yf
+    import pandas as pd
     out = {}
     print(f"[backtest] yf.download({len(tickers)} tickers, {start} → {end})…", flush=True)
     df = yf.download(
@@ -73,16 +74,12 @@ def fetch_yf_bars(tickers, start, end):
     if df is None or df.empty:
         return out
 
-    if len(tickers) == 1:
-        sym = tickers[0]
-        bars = _df_to_bars(df)
-        if bars:
-            out[sym] = bars
-        return out
-
+    # yfinance may return multi-index columns even for a single ticker when
+    # group_by="ticker". Detect and unwrap accordingly.
+    is_multi = isinstance(df.columns, pd.MultiIndex)
     for sym in tickers:
         try:
-            sub = df[sym]
+            sub = df[sym] if is_multi else df
         except (KeyError, AttributeError):
             continue
         bars = _df_to_bars(sub)
