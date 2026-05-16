@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT_BACKTEST v1.1 — yfinance-based historical backtest → Supabase.
+FEMISAGENT_BACKTEST v1.2 — yfinance-based historical backtest → Supabase.
+
+v1.2 adds per-bar SPY ret_20d baseline pass-through to compute_flags so
+the v1.5 HRT_STRONG_v2 (relative-strength gate) can fire in backtest. SPY
+fetched once at the top, indexed by date, looked up per (ticker, bar).
+Also adds the v1.5 experimental flags to the per-flag stats output.
 
 Pulls daily bars via yfinance for a watchlist over a date range, slides
 compute_flags() (imported from femisagent.py) across each ticker's history,
@@ -105,12 +110,15 @@ def _df_to_bars(sub):
     return bars
 
 
-def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90):
+def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90, spy_ret_20d_by_date=None):
     """For each ticker, slide a window, compute flags, measure forward returns.
 
     Returns (stats, fires_per_ticker, baseline) where:
         stats     = {flag: {n, win_rate_pct, avg_ret_pct, excess_ret_pct, excess_wr_pct}}
         baseline  = {n, win_rate_pct, avg_ret_pct}  # unconditional forward return
+
+    v1.2: spy_ret_20d_by_date (date_str -> float) is passed per-bar to
+    compute_flags so HRT_STRONG_v2 can fire with the right benchmark.
     """
     flag_returns = {}
     all_window_returns = []
@@ -121,7 +129,9 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90):
         fires_per_ticker[sym] = 0
         for i in range(lookback_bars, len(bars) - horizon_days):
             window = bars[i - lookback_bars: i + 1]
-            flags = compute_flags(window)
+            spy_baseline = (spy_ret_20d_by_date.get(bars[i].date)
+                            if spy_ret_20d_by_date else None)
+            flags = compute_flags(window, spy_ret_20d=spy_baseline)
             entry = bars[i].close
             future = bars[i + horizon_days].close
             ret = (future / entry - 1) * 100.0
@@ -321,8 +331,17 @@ def main():
     ok_tickers = [t for t, b in bars.items() if b]
     print(f"[backtest] Got bars for {len(ok_tickers)}/{len(args.tickers)} tickers")
 
+    # v1.2: pre-fetch SPY for the HRT_STRONG_v2 relative-strength benchmark.
+    spy_bars_dict = fetch_yf_bars(["SPY"], args.start, args.end)
+    spy_bars = spy_bars_dict.get("SPY", [])
+    spy_ret_20d_by_date = {}
+    for i in range(20, len(spy_bars)):
+        spy_ret_20d_by_date[spy_bars[i].date] = (spy_bars[i].close / spy_bars[i-20].close) - 1
+    print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates with ret_20d available")
+
     stats, fires_per_ticker, baseline = run_backtest(
-        bars, horizon_days=args.horizon, lookback_bars=args.lookback
+        bars, horizon_days=args.horizon, lookback_bars=args.lookback,
+        spy_ret_20d_by_date=spy_ret_20d_by_date,
     )
     print(
         f"[backtest] Unconditional baseline: "

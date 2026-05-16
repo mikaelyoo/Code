@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.4 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.5 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
 v1.1: FLAG_STATS hot-loaded from Supabase public.femisapien_backtest_runs
-on startup (newest row), with offline cache fallback. Set SUPABASE_URL +
-SUPABASE_KEY env vars to enable.
+on startup (newest row), with offline cache fallback.
 
-v1.2: ib_insync import made lazy (deferred into fetch_bars / run) so
-compute_flags() can be imported by femisagent_backtest.py without dragging
-in the IBKR client. Also fixes print_report() KeyError when SKIP-bucket
-rows lack price/ret_20d_pct/vol_ratio fields.
+v1.2: ib_insync import made lazy; print_report KeyError fix.
 
-v1.3: signal_verdict() thresholds rescaled to match yfinance-derived EV
-distribution (run id=6 onwards). Old 80/30/0 were calibrated to v3.8's
-hardcoded avg_ret values up to +123%. New backtest data at 60td horizon
-caps EV around +12, so thresholds become 10/5/0.
+v1.3: signal_verdict thresholds rescaled to 10/5/0 for run id=6+.
 
-v1.4: ev_score() now uses excess_ret_pct (avg_ret_pct minus unconditional
-baseline ret_pct) when present in the calibration row — i.e. flag's
-edge OVER coin-flip entry into the same universe at the same horizon, not
-raw return. Two flags can have identical raw EV but very different excess
-EV — the raw scorer was systematically rewarding flags that just rode the
-universe trend. Live agent now ranks on the edge metric.
+v1.4: ev_score uses excess_ret_pct (baseline-adjusted edge) when present;
+thresholds rescaled again to 4/2/0 for the excess distribution.
 
-Thresholds rescaled again to match the excess distribution (typically
-caps at +8 excess): EXECUTE >= 4, BUY >= 2, WATCH >= 0, AVOID < 0.
+v1.5: compute_flags adds three experimental flag variants for A/B
+comparison against the original definitions. New flags fire alongside
+old ones; both populate flag_stats in the next backtest so we can rank
+edges and decide which to keep in v1.6:
+  - HRT_STRONG_v2: requires ret_20d > SPY_ret_20d + 5pp (relative-strength
+    leader gate). Replaces "any uptrend" with "uptrend that beats the
+    market by a meaningful margin."
+  - VPIN_PERSISTENT: requires up-volume share > 0.55 for 5 consecutive
+    sessions (not just current snapshot). Filters one-day spikes.
+  - SQUEEZE_PRE_BREAKOUT: fires DURING compression (-2% < ret_5d < +2%
+    AND vol_ratio < 0.9), not after. Catches setups before they break
+    instead of chasing post-breakout reversion.
 
-Backward compat: if the loaded row has no excess_ret_pct field (id 1-5),
-falls back to legacy win_rate * avg_ret scoring.
+compute_flags() now accepts an optional spy_ret_20d parameter; when None
+(legacy callers), the v2 flag falls back gracefully (doesn't fire). The
+backtest pre-fetches SPY and passes per-bar value; live femisagent.py
+fetches SPY 20d return once per scan.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
@@ -209,8 +210,14 @@ def make_bar_obj(d):
     return Bar(d)
 
 # ── Technical flag engine ───────────────────────────────────────────────────
-def compute_flags(bars):
-    """Given list of OHLCV bars (oldest first), return FEMISAPIEN flags."""
+def compute_flags(bars, spy_ret_20d=None):
+    """Given list of OHLCV bars (oldest first), return FEMISAPIEN flags.
+
+    v1.5: optional spy_ret_20d parameter enables HRT_STRONG_v2 (relative-
+    strength gate). Backtest passes per-bar SPY ret_20d aligned by date;
+    live scanner passes single current value. When None, HRT_STRONG_v2
+    silently does not fire (legacy fallback).
+    """
     if len(bars) < 22:
         return ["INSUFFICIENT_DATA"]
 
@@ -261,6 +268,18 @@ def compute_flags(bars):
     total_vol_5 = up_vol + down_vol
     vpin = up_vol / total_vol_5 if total_vol_5 > 0 else 0.5
 
+    # v1.5: VPIN persistence — compute vpin at each of the last 5 sessions
+    # for the VPIN_PERSISTENT flag. Each window uses the prior 5 sessions.
+    vpins_recent = []
+    if len(closes) >= 11:
+        for offset in range(5):
+            up_w   = sum(volumes[-i-offset] for i in range(1, 6) if closes[-i-offset] >= closes[-i-offset-1])
+            down_w = sum(volumes[-i-offset] for i in range(1, 6) if closes[-i-offset] <  closes[-i-offset-1])
+            tot = up_w + down_w
+            if tot > 0:
+                vpins_recent.append(up_w / tot)
+    vpin_persistent_bull = len(vpins_recent) == 5 and all(v > 0.55 for v in vpins_recent)
+
     flags = []
 
     if vol_ratio >= 2.5 and ret_1d > 0.01 and uptrend:
@@ -301,13 +320,36 @@ def compute_flags(bars):
     if ret_5d < -0.02 and ret_10d > 0.05:
         flags.append("HRT_REVERSAL_RISK")
 
+    # ── v1.5 experimental flag variants ──────────────────────────────────
+    # All three fire alongside their predecessors so the next backtest can
+    # rank both side by side. v1.6 will retire the losers.
+
+    # HRT_STRONG_v2: relative-strength gate — must beat SPY 20d return by
+    # at least 5pp. Falls back to no-fire when caller didn't pass spy
+    # context (e.g., legacy live invocation without SPY pre-fetch).
+    if spy_ret_20d is not None:
+        if uptrend and ret_20d > spy_ret_20d + 0.05 and ret_5d > 0:
+            if "MOMENTUM_SURGE" not in flags and "MOMENTUM_CONTINUATION" not in flags:
+                flags.append("HRT_STRONG_v2")
+
+    # VPIN_PERSISTENT: replaces the snapshot-only VPIN_ELEVATED. Requires
+    # up-volume share > 0.55 across the trailing 5 sessions.
+    if vpin_persistent_bull and vol_ratio > 1.1:
+        flags.append("VPIN_PERSISTENT")
+
+    # SQUEEZE_PRE_BREAKOUT: replaces SQUEEZE_EXTREME. Fires while the
+    # squeeze is still live and price is near-flat with declining volume —
+    # i.e. before the breakout, not after.
+    if bb_squeeze and -0.02 < ret_5d < 0.02 and vol_ratio < 0.9:
+        flags.append("SQUEEZE_PRE_BREAKOUT")
+
     def _edge(f):
         s = FLAG_STATS.get(f, {})
         return s["excess_ret"] if "excess_ret" in s else s.get("avg_ret", 0)
     pos = [f for f in flags if _edge(f) > 0]
     neg = [f for f in flags if _edge(f) <= 0]
-    pos.sort(key=lambda f: FLAG_STATS[f]["priority"])
-    neg.sort(key=lambda f: FLAG_STATS[f]["priority"])
+    pos.sort(key=lambda f: FLAG_STATS.get(f, {}).get("priority", 999))
+    neg.sort(key=lambda f: FLAG_STATS.get(f, {}).get("priority", 999))
 
     result = []
     if pos: result.append(pos[0])
@@ -371,6 +413,15 @@ async def run(tickers=None, portfolio_mode=False):
         if not tickers:
             tickers = [p[0] for p in positions]
 
+    # v1.5: pre-fetch SPY 20d return so HRT_STRONG_v2 can fire in live scans
+    spy_ret_20d = None
+    spy_bars = await fetch_bars(ib, "SPY")
+    if len(spy_bars) >= 21:
+        spy_ret_20d = (spy_bars[-1].close - spy_bars[-21].close) / spy_bars[-21].close
+        print(f"SPY 20d benchmark: {spy_ret_20d*100:+.2f}% (HRT_STRONG_v2 gate active)")
+    else:
+        print("SPY benchmark unavailable; HRT_STRONG_v2 will not fire this scan")
+
     results = []
     total = len(tickers)
     for i, sym in enumerate(tickers, 1):
@@ -382,7 +433,7 @@ async def run(tickers=None, portfolio_mode=False):
                              "ev_score": 0, "bars": len(bars)})
             continue
 
-        flags = compute_flags(bars)
+        flags = compute_flags(bars, spy_ret_20d=spy_ret_20d)
         primary = flags[0]
         secondary = flags[1] if len(flags) > 1 else None
 
@@ -419,7 +470,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.4 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.5 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
