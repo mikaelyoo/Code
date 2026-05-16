@@ -436,12 +436,21 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         return s["excess_ret"] if "excess_ret" in s else s.get("avg_ret", 0)
     pos = [f for f in flags if _edge(f) > 0]
     neg = [f for f in flags if _edge(f) <= 0]
-    pos.sort(key=lambda f: FLAG_STATS.get(f, {}).get("priority", 999))
-    neg.sort(key=lambda f: FLAG_STATS.get(f, {}).get("priority", 999))
+    # v1.7.2: sort by edge magnitude (best pos first, worst neg first)
+    # so primary = strongest positive signal, secondary = strongest warning.
+    pos.sort(key=lambda f: (-_edge(f), FLAG_STATS.get(f, {}).get("priority", 999)))
+    neg.sort(key=lambda f: (_edge(f), FLAG_STATS.get(f, {}).get("priority", 999)))
 
+    # v1.7.2 fix: previously returned only [pos[0], neg[0]] — culled all
+    # other fires. New flags (HRT_STRONG_v4, PARABOLIC_RECOVERY, etc.)
+    # had no FLAG_STATS entry so _edge=0, sorted last, never returned,
+    # never tracked by backtest. Now return ALL fired flags with primary
+    # (top positive) + secondary (top negative) at front, rest appended.
     result = []
     if pos: result.append(pos[0])
     if neg: result.append(neg[0])
+    result.extend(pos[1:])
+    result.extend(neg[1:])
     return result if result else ["NEUTRAL"]
 
 # ── IBKR data fetch ─────────────────────────────────────────────────────────
