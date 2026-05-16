@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.7.3 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7.4 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -43,9 +43,13 @@ v1.7 — first cull + retry round:
     PARABOLIC_RECOVERY    — parabolic AND SPY ret_60d > 0; isolates the
                             2009-style / 2023+ recovery sub-regime where
                             PARABOLIC_BLOCK has its strongest edge.
-    PARABOLIC_CRISIS      — parabolic AND SPY ret_60d <= 0; suspected
-                            dead-cat-bounce regime (negative excess
-                            expected). Validates the regime hypothesis.
+    PARABOLIC_CRISIS      — parabolic AND SPY ret_60d <= 0 AND
+                            (OBV_THRUST OR HRT_STRONG_v4). Raw form
+                            (no guard) had bimodal distribution: 2022
+                            fires lost -12.68%, 2025 fires +53.68%.
+                            v1.7.4 guard requires concurrent volume or
+                            sustained-uptrend confirmation to filter the
+                            failed-momentum half.
 
   Backtest v1.4 also fixes the Wilson-CI demote rule: was demoting on
   Wilson_lower<0.5 alone, killing fat-tail-positive flags like
@@ -435,11 +439,19 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if parabolic and spy_ret_60d is not None and spy_ret_60d > 0:
         flags.append("PARABOLIC_RECOVERY")
 
-    # PARABOLIC_CRISIS: opposite half — parabolic move WHILE SPY still
-    # falling. Expected to be dead-cat bounces with negative forward
-    # return. If this fires negative, confirms the regime hypothesis.
+    # PARABOLIC_CRISIS: parabolic during SPY-down regime. Original raw
+    # backtest showed +13.83% bull excess, but per-year breakdown
+    # revealed bimodal distribution: 2022 fires (true crisis) lost
+    # -12.68% avg, 2025 fires (brief SPY pullback + thematic explosions)
+    # made +53.68%. To preserve only the validated-strength fires and
+    # filter the 2022 dead-cat losers, v1.7.4 requires concurrent
+    # "real strength" confirmation: either OBV_THRUST (volume thrust)
+    # OR HRT_STRONG_v4 (sustained relative-strength uptrend including
+    # ma50). Those proxies for "real catalyst" should exclude failed
+    # momentum pops.
     if parabolic and spy_ret_60d is not None and spy_ret_60d <= 0:
-        flags.append("PARABOLIC_CRISIS")
+        if "OBV_THRUST" in flags or "HRT_STRONG_v4" in flags:
+            flags.append("PARABOLIC_CRISIS")
 
     def _edge(f):
         s = FLAG_STATS.get(f, {})
@@ -589,7 +601,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.7.3 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7.4 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 

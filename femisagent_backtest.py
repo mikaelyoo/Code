@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT_BACKTEST v1.4 — yfinance-based historical backtest → Supabase.
+FEMISAGENT_BACKTEST v1.5 — yfinance-based historical backtest → Supabase.
 
 v1.2: per-bar SPY ret_20d pass-through.
 v1.3: --investigate-flag mode.
-
-v1.4: two fixes from the v1.6 dual-regime analysis:
-  - Wilson-CI demote rule now requires BOTH `Wilson_lower < threshold`
-    AND `excess_ret_pct < 0`. The pure-WR version killed fat-tail
-    positive signals like SQUEEZE_BULLISH (54% WR, +30% avg_ret) where
-    mediocre WR pairs with huge avg_ret and very positive excess.
-  - Pre-fetch SPY 60d return AND 60d-drawdown alongside 20d return.
-    Passed per-bar to compute_flags for the v1.7 PARABOLIC_RECOVERY
-    flag (gates on SPY drawdown from 60d high).
+v1.4: Wilson rule requires excess<0 AND wilson_lower<0.5; SPY 60d ret +
+      drawdown pre-fetch.
+v1.5: cleaned debug counters from v1.4.x diagnostic runs. The
+      compute_flags return-all-flags bug (was returning only top pos +
+      top neg, culling new flags before backtest tracking) is fixed in
+      femisagent v1.7.2.
 
 Pulls daily bars via yfinance for a watchlist over a date range, slides
 compute_flags() (imported from femisagent.py) across each ticker's history,
@@ -126,10 +123,6 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
     all_window_returns = []
     fires_per_ticker = {}
     investigation = []
-    # v1.4.2 debug: count parabolic + spy_ret_60d availability
-    debug = {"parabolic_total": 0, "parabolic_with_spy60d": 0,
-             "parabolic_recov_should_fire": 0, "parabolic_crisis_should_fire": 0,
-             "spy60d_none_dates_sample": []}
     for sym, bars in bars_by_ticker.items():
         if len(bars) < lookback_bars + horizon_days + 5:
             continue
@@ -142,17 +135,6 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
             spy_dd  = spy_60d_dd_by_date.get(date_key)  if spy_60d_dd_by_date  else None
             flags = compute_flags(window, spy_ret_20d=spy_20d,
                                   spy_ret_60d=spy_60d, spy_60d_dd_pct=spy_dd)
-            # v1.4.2 debug — inspect why PARABOLIC_RECOVERY/CRISIS don't fire
-            if "PARABOLIC_BLOCK" in flags:
-                debug["parabolic_total"] += 1
-                if spy_60d is not None:
-                    debug["parabolic_with_spy60d"] += 1
-                    if spy_60d > 0:
-                        debug["parabolic_recov_should_fire"] += 1
-                    else:
-                        debug["parabolic_crisis_should_fire"] += 1
-                elif len(debug["spy60d_none_dates_sample"]) < 5:
-                    debug["spy60d_none_dates_sample"].append((sym, date_key))
             entry = bars[i].close
             future = bars[i + horizon_days].close
             ret = (future / entry - 1) * 100.0
@@ -201,14 +183,6 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
             "excess_ret_pct": round(avg_ret - baseline["avg_ret_pct"], 2),
             "excess_wr_pct": round(wr_pct - baseline["win_rate_pct"], 1),
         }
-    # v1.4.2 debug emit
-    print(f"[backtest-debug] PARABOLIC_BLOCK fires: {debug['parabolic_total']}, "
-          f"of which spy_ret_60d available: {debug['parabolic_with_spy60d']}, "
-          f"should fire RECOVERY: {debug['parabolic_recov_should_fire']}, "
-          f"CRISIS: {debug['parabolic_crisis_should_fire']}")
-    if debug["spy60d_none_dates_sample"]:
-        print(f"[backtest-debug] Sample dates where parabolic fired but spy_ret_60d was None: "
-              f"{debug['spy60d_none_dates_sample']}")
     return stats, fires_per_ticker, baseline, investigation
 
 
@@ -403,16 +377,6 @@ def main():
         spy_60d_dd_by_date[spy_bars[i].date] = (spy_bars[i].close - high_60d) / high_60d
     print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates w/ ret_20d, "
           f"{len(spy_ret_60d_by_date)} w/ ret_60d + 60d-drawdown")
-
-    # Debug: how often does SPY 60d-drawdown go below -8% in this sample?
-    deep_dd = [(d, v) for d, v in spy_60d_dd_by_date.items() if v < -0.08]
-    all_dd_vals = list(spy_60d_dd_by_date.values())
-    min_dd = min(all_dd_vals) if all_dd_vals else 0.0
-    print(f"[backtest] SPY dates with 60d-drawdown < -8%: {len(deep_dd)} "
-          f"(min observed: {min_dd:.3f})")
-    if deep_dd:
-        sample = sorted(deep_dd, key=lambda x: x[1])[:3]
-        print(f"  worst 3: {sample}")
 
     stats, fires_per_ticker, baseline, investigation = run_backtest(
         bars, horizon_days=args.horizon, lookback_bars=args.lookback,
