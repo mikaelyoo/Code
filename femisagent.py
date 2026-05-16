@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.7.4 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7.5 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -197,8 +197,17 @@ BRIDGE_TOKEN = os.environ.get("JARVIS_BRIDGE_TOKEN", "")
 USE_BRIDGE   = os.environ.get("USE_BRIDGE", "1") == "1"
 
 def fetch_bars_via_bridge(symbol):
-    """Fetch bars from Jarvis bridge instead of direct IBKR connection."""
+    """Fetch bars from Jarvis bridge instead of direct IBKR connection.
+
+    v1.7.5: payload now includes jsonrpc/id required by the bridge's
+    pydantic JSON-RPC 2.0 validation. The pre-v1.7.5 form returned 400
+    Bad Request silently (urlopen raises HTTPError on 4xx, the except
+    clause below swallows it, function returns []). All bridge fetches
+    had been silently failing — every ticker showed "insufficient data".
+    """
     payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
         "method": "tools/call",
         "params": {"name": "fetch_bars", "arguments": {"symbol": symbol}}
     }).encode()
@@ -601,7 +610,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.7.4 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7.5 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
