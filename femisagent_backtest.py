@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT_BACKTEST v1.3 — yfinance-based historical backtest → Supabase.
+FEMISAGENT_BACKTEST v1.4 — yfinance-based historical backtest → Supabase.
 
-v1.2 added per-bar SPY ret_20d pass-through for HRT_STRONG_v2.
+v1.2: per-bar SPY ret_20d pass-through.
+v1.3: --investigate-flag mode.
 
-v1.3 adds --investigate-flag FLAG_NAME for deep-dive analysis on a single
-flag. Records per-fire (ticker, date, year, fwd_ret, max_drawdown_during)
-and emits per-year stratification + top-ticker breakdown + return
-distribution percentiles. Used to understand WHY a flag has the edge it
-has (e.g. PARABOLIC_BLOCK: is the +17% bear excess concentrated in 2009
-recovery? Concentrated in a few names? What's the worst-case drawdown?).
+v1.4: two fixes from the v1.6 dual-regime analysis:
+  - Wilson-CI demote rule now requires BOTH `Wilson_lower < threshold`
+    AND `excess_ret_pct < 0`. The pure-WR version killed fat-tail
+    positive signals like SQUEEZE_BULLISH (54% WR, +30% avg_ret) where
+    mediocre WR pairs with huge avg_ret and very positive excess.
+  - Pre-fetch SPY 60d return AND 60d-drawdown alongside 20d return.
+    Passed per-bar to compute_flags for the v1.7 PARABOLIC_RECOVERY
+    flag (gates on SPY drawdown from 60d high).
 
 Pulls daily bars via yfinance for a watchlist over a date range, slides
 compute_flags() (imported from femisagent.py) across each ticker's history,
@@ -112,14 +115,12 @@ def _df_to_bars(sub):
 
 
 def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
-                 spy_ret_20d_by_date=None, investigate_flag=None):
+                 spy_ret_20d_by_date=None, spy_ret_60d_by_date=None,
+                 spy_60d_dd_by_date=None, investigate_flag=None):
     """For each ticker, slide a window, compute flags, measure forward returns.
 
-    Returns (stats, fires_per_ticker, baseline, investigation) where:
-        stats         = {flag: {n, win_rate_pct, avg_ret_pct, excess_ret_pct, excess_wr_pct}}
-        baseline      = {n, win_rate_pct, avg_ret_pct}
-        investigation = [] or list of {sym, date, year, fwd_ret, max_dd_pct}
-                        for every fire of investigate_flag.
+    v1.4: also passes spy_ret_60d and spy_60d_dd_pct to compute_flags for
+    regime-gated flags (PARABOLIC_RECOVERY).
     """
     flag_returns = {}
     all_window_returns = []
@@ -131,9 +132,12 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
         fires_per_ticker[sym] = 0
         for i in range(lookback_bars, len(bars) - horizon_days):
             window = bars[i - lookback_bars: i + 1]
-            spy_baseline = (spy_ret_20d_by_date.get(bars[i].date)
-                            if spy_ret_20d_by_date else None)
-            flags = compute_flags(window, spy_ret_20d=spy_baseline)
+            date_key = bars[i].date
+            spy_20d = spy_ret_20d_by_date.get(date_key) if spy_ret_20d_by_date else None
+            spy_60d = spy_ret_60d_by_date.get(date_key) if spy_ret_60d_by_date else None
+            spy_dd  = spy_60d_dd_by_date.get(date_key)  if spy_60d_dd_by_date  else None
+            flags = compute_flags(window, spy_ret_20d=spy_20d,
+                                  spy_ret_60d=spy_60d, spy_60d_dd_pct=spy_dd)
             entry = bars[i].close
             future = bars[i + horizon_days].close
             ret = (future / entry - 1) * 100.0
@@ -194,28 +198,43 @@ def wilson_lower(p, n, z=1.96):
 
 
 def apply_wilson_demote(stats, min_n=10, min_wilson_lower=0.5, z=1.96):
-    """Neutralize (win_rate→50, avg_ret→0) flags failing the rule. Returns list of demotions."""
+    """Neutralize flags failing BOTH (a) low statistical confidence AND
+    (b) negative excess return. Pure-WR rule killed fat-tail-positive
+    signals like SQUEEZE_BULLISH (54% WR + +30% avg_ret); v1.4 requires
+    the flag to ALSO be unprofitable in excess terms before demoting.
+    """
     demoted = []
     for flag, s in stats.items():
         p = s["win_rate_pct"] / 100.0
         n = s["n"]
+        excess = s.get("excess_ret_pct", s["avg_ret_pct"])
+
+        # n<min_n always demotes (sample size unreliable) but ONLY if
+        # the unreliable signal is also unprofitable.
         if n < min_n:
-            reason = f"n<{min_n}"
+            if excess >= 0:
+                continue
+            reason = f"n<{min_n} AND excess={excess:+.2f}%<0"
         else:
             wl = wilson_lower(p, n, z)
-            if wl < min_wilson_lower:
-                reason = f"Wilson_lower={wl:.3f}<{min_wilson_lower}"
-            else:
+            if wl >= min_wilson_lower:
                 continue
+            if excess >= 0:
+                continue  # Mediocre WR but positive excess → keep (fat-tail signal)
+            reason = f"Wilson_lower={wl:.3f}<{min_wilson_lower} AND excess={excess:+.2f}%<0"
+
         demoted.append({
             "flag": flag,
             "n": n,
             "prev_wr_pct": s["win_rate_pct"],
             "prev_avg_ret_pct": s["avg_ret_pct"],
+            "prev_excess_ret_pct": excess,
             "reason": reason,
         })
         s["win_rate_pct"] = 50.0
         s["avg_ret_pct"] = 0.0
+        if "excess_ret_pct" in s:
+            s["excess_ret_pct"] = 0.0
     return demoted
 
 
@@ -347,17 +366,26 @@ def main():
     ok_tickers = [t for t, b in bars.items() if b]
     print(f"[backtest] Got bars for {len(ok_tickers)}/{len(args.tickers)} tickers")
 
-    # v1.2: pre-fetch SPY for the HRT_STRONG_v2 relative-strength benchmark.
+    # v1.4: pre-fetch SPY for regime context (20d ret, 60d ret, 60d drawdown).
     spy_bars_dict = fetch_yf_bars(["SPY"], args.start, args.end)
     spy_bars = spy_bars_dict.get("SPY", [])
     spy_ret_20d_by_date = {}
+    spy_ret_60d_by_date = {}
+    spy_60d_dd_by_date = {}
     for i in range(20, len(spy_bars)):
         spy_ret_20d_by_date[spy_bars[i].date] = (spy_bars[i].close / spy_bars[i-20].close) - 1
-    print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates with ret_20d available")
+    for i in range(60, len(spy_bars)):
+        spy_ret_60d_by_date[spy_bars[i].date] = (spy_bars[i].close / spy_bars[i-60].close) - 1
+        high_60d = max(b.close for b in spy_bars[i-60:i+1])
+        spy_60d_dd_by_date[spy_bars[i].date] = (spy_bars[i].close - high_60d) / high_60d
+    print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates w/ ret_20d, "
+          f"{len(spy_ret_60d_by_date)} w/ ret_60d + 60d-drawdown")
 
     stats, fires_per_ticker, baseline, investigation = run_backtest(
         bars, horizon_days=args.horizon, lookback_bars=args.lookback,
         spy_ret_20d_by_date=spy_ret_20d_by_date,
+        spy_ret_60d_by_date=spy_ret_60d_by_date,
+        spy_60d_dd_by_date=spy_60d_dd_by_date,
         investigate_flag=args.investigate_flag,
     )
     print(

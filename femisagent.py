@@ -1,28 +1,51 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.6 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
-v1.1: FLAG_STATS hot-loaded from Supabase.
-v1.2: lazy ib_insync import; print_report KeyError fix.
-v1.3: signal_verdict thresholds rescaled to 10/5/0.
-v1.4: ev_score uses excess_ret_pct; thresholds 4/2/0.
-v1.5: experimental HRT_STRONG_v2 / VPIN_PERSISTENT / SQUEEZE_PRE_BREAKOUT.
-      A/B backtest showed all three failed to beat their predecessors.
+v1.1: Supabase calibration hot-load.
+v1.2: lazy ib_insync; print_report KeyError fix.
+v1.3: thresholds 10/5/0.
+v1.4: excess_ret scoring; thresholds 4/2/0.
+v1.5: A/B'd HRT_STRONG_v2 / VPIN_PERSISTENT / SQUEEZE_PRE_BREAKOUT — all lost.
+v1.6: A/B'd HRT_STRONG_v3 / VPIN_PERSISTENT (still) / SQUEEZE_PRE_BREAKOUT (still)
+      / OBV_BULL/BEAR / SQUEEZE_BULLISH/BEARISH. Mixed results.
 
-v1.6: second-round experimental variants based on v1.5 lessons:
-  - HRT_STRONG_v3: BOTH absolute (ret_20d > 10%) AND relative-strength
-    (ret_20d > SPY + 10pp). v2's SPY+5pp turned out LOOSER than +10%
-    absolute in the bull regime — v3 makes it strictly tighter.
-  - OBV_BULL_DIVERGENCE / OBV_BEAR_DIVERGENCE: replace VPIN proxy with
-    On-Balance-Volume divergence vs price. Different concept entirely —
-    detects accumulation (OBV up while price flat) and distribution
-    (OBV flat/down while price up).
-  - SQUEEZE_BULLISH / SQUEEZE_BEARISH: add MACD-histogram bias filter
-    to squeeze. Doesn't just fire on compression — fires with direction.
+v1.7 — first cull + retry round:
 
-All new flags fire alongside existing ones. The next backtest A/Bs them.
+  Dropped (failed A/B over two cycles):
+    HRT_STRONG_v2, HRT_STRONG_v3, VPIN_PERSISTENT, VPIN_ELEVATED,
+    SQUEEZE_EXTREME, SQUEEZE_PRE_BREAKOUT, SQUEEZE_BEARISH,
+    OBV_BULL_DIVERGENCE.
+
+  Kept from v1.6 wins:
+    SQUEEZE_BULLISH (+18% bull excess but Wilson-demoted on WR alone),
+    OBV_BEAR_DIVERGENCE (regime-flips: -3.3% bull / +4.2% bear).
+
+  New variants (6) replacing the failures:
+    HRT_STRONG_v4         — like v3 but no MOMENTUM_CONT exclusion;
+                            allows co-firing as conviction overlay.
+    VPIN_THRUST           — vpin>0.65 + ret_1d>1% + uptrend + vol>1.5;
+                            "explosive buying with confirming flow."
+    SQUEEZE_RESOLVING_BULL — squeeze just broke (yesterday yes, today no)
+                            with bullish thrust. Catches the transition.
+    SQUEEZE_RESOLVING_BEAR — same transition, bearish direction.
+    OBV_THRUST            — obv_norm>0.30 + ret_20d>5% + ret_5d>0;
+                            concurrent momentum across price + flow.
+    PARABOLIC_RECOVERY    — parabolic AND spy 60d drawdown < -8%;
+                            isolates the 2009-style and 2023-style
+                            recovery-from-correction sub-regime where
+                            PARABOLIC_BLOCK actually has edge.
+
+  Backtest v1.4 also fixes the Wilson-CI demote rule: was demoting on
+  Wilson_lower<0.5 alone, killing fat-tail-positive flags like
+  SQUEEZE_BULLISH (54% WR, +30% avg_ret, +18% excess). Now requires
+  BOTH Wilson_lower<0.5 AND excess_ret<0 — only demotes signals that
+  are actually unprofitable.
+
+compute_flags now accepts spy_ret_20d, spy_ret_60d, spy_60d_dd_pct as
+optional regime-context params. PARABOLIC_RECOVERY uses spy_60d_dd_pct.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
@@ -202,13 +225,15 @@ def make_bar_obj(d):
     return Bar(d)
 
 # ── Technical flag engine ───────────────────────────────────────────────────
-def compute_flags(bars, spy_ret_20d=None):
+def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None):
     """Given list of OHLCV bars (oldest first), return FEMISAPIEN flags.
 
-    v1.5: optional spy_ret_20d parameter enables HRT_STRONG_v2 (relative-
-    strength gate). Backtest passes per-bar SPY ret_20d aligned by date;
-    live scanner passes single current value. When None, HRT_STRONG_v2
-    silently does not fire (legacy fallback).
+    v1.7: optional regime context params:
+        spy_ret_20d     — SPY 20d return as decimal (HRT_STRONG_v4 gate)
+        spy_ret_60d     — SPY 60d return as decimal (regime classifier)
+        spy_60d_dd_pct  — SPY drawdown from 60d high as decimal, negative
+                          (PARABOLIC_RECOVERY gate)
+    None values silently disable the dependent flag rules.
     """
     if len(bars) < 22:
         return ["INSUFFICIENT_DATA"]
@@ -260,17 +285,13 @@ def compute_flags(bars, spy_ret_20d=None):
     total_vol_5 = up_vol + down_vol
     vpin = up_vol / total_vol_5 if total_vol_5 > 0 else 0.5
 
-    # v1.5: VPIN persistence — compute vpin at each of the last 5 sessions
-    # for the VPIN_PERSISTENT flag. Each window uses the prior 5 sessions.
-    vpins_recent = []
-    if len(closes) >= 11:
-        for offset in range(5):
-            up_w   = sum(volumes[-i-offset] for i in range(1, 6) if closes[-i-offset] >= closes[-i-offset-1])
-            down_w = sum(volumes[-i-offset] for i in range(1, 6) if closes[-i-offset] <  closes[-i-offset-1])
-            tot = up_w + down_w
-            if tot > 0:
-                vpins_recent.append(up_w / tot)
-    vpin_persistent_bull = len(vpins_recent) == 5 and all(v > 0.55 for v in vpins_recent)
+    # v1.7: also need yesterday's bb_squeeze for SQUEEZE_RESOLVING_*.
+    # bb_width_hist[-1] is yesterday's bb_width (window closes[-21:-1]).
+    if len(bb_width_hist) >= 21:
+        yesterday_avg_width = sum(bb_width_hist[-21:-1]) / 20
+        bb_squeeze_yesterday = bb_width_hist[-1] < (yesterday_avg_width * 0.75)
+    else:
+        bb_squeeze_yesterday = False
 
     # v1.6: OBV (On-Balance-Volume) for divergence detection.
     # Running cumulative: +volume on up-close days, -volume on down-close days.
@@ -308,13 +329,12 @@ def compute_flags(bars, spy_ret_20d=None):
 
     flags = []
 
+    # ── Original flag rules (kept) ───────────────────────────────────────
+
     if vol_ratio >= 2.5 and ret_1d > 0.01 and uptrend:
         flags.append("GS_ACCUM")
     elif vol_ratio >= 1.5 and ret_1d > 0.005 and uptrend:
         flags.append("GS_MILD_ACCUM")
-
-    if bb_squeeze and ret_5d > 0.05 and vol_ratio > 1.3:
-        flags.append("SQUEEZE_EXTREME")
 
     if breakout_20d and vol_ratio > 1.2:
         flags.append("20D_BREAKOUT")
@@ -323,9 +343,6 @@ def compute_flags(bars, spy_ret_20d=None):
         flags.append("MOMENTUM_SURGE")
     elif ret_10d > 0.05 and ret_5d > 0.02 and uptrend:
         flags.append("MOMENTUM_CONTINUATION")
-
-    if vpin > 0.65 and vol_ratio > 1.1:
-        flags.append("VPIN_ELEVATED")
 
     if uptrend and ret_20d > 0.10 and ret_5d > 0:
         if "MOMENTUM_SURGE" not in flags and "MOMENTUM_CONTINUATION" not in flags:
@@ -346,59 +363,59 @@ def compute_flags(bars, spy_ret_20d=None):
     if ret_5d < -0.02 and ret_10d > 0.05:
         flags.append("HRT_REVERSAL_RISK")
 
-    # ── v1.5 experimental flag variants ──────────────────────────────────
-    # All three fire alongside their predecessors so the next backtest can
-    # rank both side by side. v1.6 will retire the losers.
+    # ── v1.6 kept (proven edge) ──────────────────────────────────────────
 
-    # HRT_STRONG_v2: relative-strength gate — must beat SPY 20d return by
-    # at least 5pp. Falls back to no-fire when caller didn't pass spy
-    # context (e.g., legacy live invocation without SPY pre-fetch).
-    if spy_ret_20d is not None:
-        if uptrend and ret_20d > spy_ret_20d + 0.05 and ret_5d > 0:
-            if "MOMENTUM_SURGE" not in flags and "MOMENTUM_CONTINUATION" not in flags:
-                flags.append("HRT_STRONG_v2")
+    # SQUEEZE_BULLISH: +18.04% bull excess on n=94. Mediocre WR (54%) was
+    # incorrectly Wilson-demoted; v1.4 backtest now requires excess<0 too.
+    if bb_squeeze and -0.05 < ret_5d < 0.05 and macd_hist > 0:
+        flags.append("SQUEEZE_BULLISH")
 
-    # VPIN_PERSISTENT: replaces the snapshot-only VPIN_ELEVATED. Requires
-    # up-volume share > 0.55 across the trailing 5 sessions.
-    if vpin_persistent_bull and vol_ratio > 1.1:
-        flags.append("VPIN_PERSISTENT")
-
-    # SQUEEZE_PRE_BREAKOUT: replaces SQUEEZE_EXTREME. Fires while the
-    # squeeze is still live and price is near-flat with declining volume —
-    # i.e. before the breakout, not after.
-    if bb_squeeze and -0.02 < ret_5d < 0.02 and vol_ratio < 0.9:
-        flags.append("SQUEEZE_PRE_BREAKOUT")
-
-    # ── v1.6 experimental flag variants ──────────────────────────────────
-    # v1.5's three new flags all failed to beat predecessors in the A/B.
-    # v1.6 retries with tighter / structurally-different conditions.
-
-    # HRT_STRONG_v3: BOTH absolute (>10%) AND relative-strength (>SPY+10pp).
-    # v2 was looser than the original because SPY+5pp was usually < 10%
-    # absolute. v3 requires BOTH thresholds — strictly tighter than either.
-    if spy_ret_20d is not None:
-        if uptrend and ret_20d > 0.10 and ret_20d > spy_ret_20d + 0.10 and ret_5d > 0:
-            if "MOMENTUM_SURGE" not in flags and "MOMENTUM_CONTINUATION" not in flags:
-                flags.append("HRT_STRONG_v3")
-
-    # OBV divergence — accumulation/distribution detection.
-    # Bullish: price flat/down but volume biased upward (smart-money buying
-    # under cover of stagnation).
-    # Bearish: price up but volume neutral/negative (rally without conviction,
-    # potentially distribution into strength).
-    if obv_normalized > 0.20 and ret_20d < 0.02:
-        flags.append("OBV_BULL_DIVERGENCE")
+    # OBV_BEAR_DIVERGENCE: regime-conditional (-3.3% bull, +4.2% bear).
+    # Useful both ways. Live scorer treats as AVOID when bull; signal
+    # consumer reverses interpretation when SPY 60d return < 0.
     if obv_normalized < 0.0 and ret_20d > 0.05:
         flags.append("OBV_BEAR_DIVERGENCE")
 
-    # SQUEEZE + MACD directional bias. Fires near-flat price during a
-    # squeeze, conditional on MACD histogram direction. Two opposite
-    # signals from the same setup.
-    if bb_squeeze and -0.05 < ret_5d < 0.05:
-        if macd_hist > 0:
-            flags.append("SQUEEZE_BULLISH")
-        elif macd_hist < 0:
-            flags.append("SQUEEZE_BEARISH")
+    # ── v1.7 reworks of the 6 failed/dead flag families ──────────────────
+
+    # HRT_STRONG_v4: like v3 (both absolute + SPY-relative gates) but
+    # WITHOUT the MOMENTUM_CONTINUATION-not-in-flags exclusion. v3 had 0
+    # fires because the exclusion clause killed every candidate. v4 lets
+    # it co-fire as a conviction overlay on momentum signals.
+    if spy_ret_20d is not None:
+        if uptrend and ret_20d > 0.10 and ret_20d > spy_ret_20d + 0.10 and ret_5d > 0:
+            flags.append("HRT_STRONG_v4")
+
+    # VPIN_THRUST: replaces VPIN_ELEVATED. Stricter conditions to capture
+    # actual buying thrust (not just lagging trend echo): explosive
+    # up-day with volume + trend confirmation.
+    if vpin > 0.65 and ret_1d > 0.01 and uptrend and vol_ratio > 1.5:
+        flags.append("VPIN_THRUST")
+
+    # SQUEEZE_RESOLVING_BULL: replaces SQUEEZE_PRE_BREAKOUT. Fires on the
+    # TRANSITION: squeeze yesterday → no squeeze today + up-day thrust +
+    # volume. Catches the breakout itself, not pre or post.
+    if bb_squeeze_yesterday and not bb_squeeze and ret_1d > 0.01 and vol_ratio > 1.5:
+        flags.append("SQUEEZE_RESOLVING_BULL")
+
+    # SQUEEZE_RESOLVING_BEAR: opposite — bearish resolution.
+    if bb_squeeze_yesterday and not bb_squeeze and ret_1d < -0.01 and vol_ratio > 1.5:
+        flags.append("SQUEEZE_RESOLVING_BEAR")
+
+    # OBV_THRUST: replaces OBV_BULL_DIVERGENCE. The original "OBV up while
+    # price flat" hypothesis (accumulation) failed (-4.43% excess). v2:
+    # require CONCURRENT momentum in OBV + price. Confirmation, not
+    # divergence.
+    if obv_normalized > 0.30 and ret_20d > 0.05 and ret_5d > 0:
+        flags.append("OBV_THRUST")
+
+    # PARABOLIC_RECOVERY: refines PARABOLIC_BLOCK by gating on SPY drawdown.
+    # Per-year breakdown showed PARABOLIC_BLOCK's edge concentrates in
+    # post-crash recovery years (2009 / 2023+) and loses money in
+    # peak-bull years (2021 / 2008-crisis). The gate "SPY 60d drawdown
+    # < -8%" approximates the recovery sub-regime.
+    if parabolic and spy_60d_dd_pct is not None and spy_60d_dd_pct < -0.08:
+        flags.append("PARABOLIC_RECOVERY")
 
     def _edge(f):
         s = FLAG_STATS.get(f, {})
@@ -470,14 +487,24 @@ async def run(tickers=None, portfolio_mode=False):
         if not tickers:
             tickers = [p[0] for p in positions]
 
-    # v1.5: pre-fetch SPY 20d return so HRT_STRONG_v2 can fire in live scans
+    # v1.7: pre-fetch SPY for regime context (20d, 60d, 60d-drawdown).
     spy_ret_20d = None
+    spy_ret_60d = None
+    spy_60d_dd_pct = None
     spy_bars = await fetch_bars(ib, "SPY")
-    if len(spy_bars) >= 21:
+    if len(spy_bars) >= 61:
+        c_now = spy_bars[-1].close
+        spy_ret_20d = (c_now - spy_bars[-21].close) / spy_bars[-21].close
+        spy_ret_60d = (c_now - spy_bars[-61].close) / spy_bars[-61].close
+        high_60d = max(b.close for b in spy_bars[-60:])
+        spy_60d_dd_pct = (c_now - high_60d) / high_60d
+        print(f"SPY regime: 20d={spy_ret_20d*100:+.2f}% 60d={spy_ret_60d*100:+.2f}% "
+              f"60d-dd={spy_60d_dd_pct*100:+.2f}% (v1.7 regime gates active)")
+    elif len(spy_bars) >= 21:
         spy_ret_20d = (spy_bars[-1].close - spy_bars[-21].close) / spy_bars[-21].close
-        print(f"SPY 20d benchmark: {spy_ret_20d*100:+.2f}% (HRT_STRONG_v2 gate active)")
+        print(f"SPY partial (20d only): {spy_ret_20d*100:+.2f}% — PARABOLIC_RECOVERY will not fire")
     else:
-        print("SPY benchmark unavailable; HRT_STRONG_v2 will not fire this scan")
+        print("SPY benchmark unavailable; v1.7 regime-gated flags will not fire")
 
     results = []
     total = len(tickers)
@@ -490,7 +517,9 @@ async def run(tickers=None, portfolio_mode=False):
                              "ev_score": 0, "bars": len(bars)})
             continue
 
-        flags = compute_flags(bars, spy_ret_20d=spy_ret_20d)
+        flags = compute_flags(bars, spy_ret_20d=spy_ret_20d,
+                              spy_ret_60d=spy_ret_60d,
+                              spy_60d_dd_pct=spy_60d_dd_pct)
         primary = flags[0]
         secondary = flags[1] if len(flags) > 1 else None
 
@@ -527,7 +556,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.6 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
