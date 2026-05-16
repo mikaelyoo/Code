@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.7.6 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7.7 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -196,7 +196,7 @@ BRIDGE_URL   = os.environ.get("BRIDGE_URL", "http://localhost:8765")
 BRIDGE_TOKEN = os.environ.get("JARVIS_BRIDGE_TOKEN", "")
 USE_BRIDGE   = os.environ.get("USE_BRIDGE", "1") == "1"
 
-# v1.7.6: bridge upgraded to streamable-HTTP MCP transport which requires
+# v1.7.7: bridge upgraded to streamable-HTTP MCP transport which requires
 # Mcp-Session-Id header on every tools/call. Get it from initialize.
 _BRIDGE_SESSION = None
 
@@ -254,7 +254,7 @@ def _bridge_session():
 def fetch_bars_via_bridge(symbol):
     """Fetch bars from Jarvis bridge instead of direct IBKR connection.
 
-    v1.7.6: now does the MCP session handshake (initialize → cache
+    v1.7.7: now does the MCP session handshake (initialize → cache
     Mcp-Session-Id → use it on every tools/call). The bridge upgraded
     to streamable-HTTP transport mid-session; older one-shot calls now
     return 400 "Missing session ID".
@@ -593,6 +593,18 @@ async def run(tickers=None, portfolio_mode=False):
             portfolio_data[sym] = {"qty": qty, "avgCost": cost}
         if not tickers:
             tickers = [p[0] for p in positions]
+        else:
+            # v1.7.7: union — when both --portfolio and --tickers are given,
+            # scan the watchlist AND add any held tickers not already in it.
+            # Portfolio_data annotations still apply for held names.
+            existing = set(tickers)
+            for sym, *_ in positions:
+                if sym not in existing:
+                    tickers.append(sym)
+                    existing.add(sym)
+            print(f"Watchlist union with portfolio: {len(tickers)} total tickers "
+                  f"({len(existing) - len(positions)} watchlist-only, "
+                  f"{len(positions)} held)")
 
     # v1.7: pre-fetch SPY for regime context (20d, 60d, 60d-drawdown).
     spy_ret_20d = None
@@ -663,7 +675,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.7.6 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7.7 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
