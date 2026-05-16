@@ -126,6 +126,10 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
     all_window_returns = []
     fires_per_ticker = {}
     investigation = []
+    # v1.4.2 debug: count parabolic + spy_ret_60d availability
+    debug = {"parabolic_total": 0, "parabolic_with_spy60d": 0,
+             "parabolic_recov_should_fire": 0, "parabolic_crisis_should_fire": 0,
+             "spy60d_none_dates_sample": []}
     for sym, bars in bars_by_ticker.items():
         if len(bars) < lookback_bars + horizon_days + 5:
             continue
@@ -138,6 +142,17 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
             spy_dd  = spy_60d_dd_by_date.get(date_key)  if spy_60d_dd_by_date  else None
             flags = compute_flags(window, spy_ret_20d=spy_20d,
                                   spy_ret_60d=spy_60d, spy_60d_dd_pct=spy_dd)
+            # v1.4.2 debug — inspect why PARABOLIC_RECOVERY/CRISIS don't fire
+            if "PARABOLIC_BLOCK" in flags:
+                debug["parabolic_total"] += 1
+                if spy_60d is not None:
+                    debug["parabolic_with_spy60d"] += 1
+                    if spy_60d > 0:
+                        debug["parabolic_recov_should_fire"] += 1
+                    else:
+                        debug["parabolic_crisis_should_fire"] += 1
+                elif len(debug["spy60d_none_dates_sample"]) < 5:
+                    debug["spy60d_none_dates_sample"].append((sym, date_key))
             entry = bars[i].close
             future = bars[i + horizon_days].close
             ret = (future / entry - 1) * 100.0
@@ -186,6 +201,14 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
             "excess_ret_pct": round(avg_ret - baseline["avg_ret_pct"], 2),
             "excess_wr_pct": round(wr_pct - baseline["win_rate_pct"], 1),
         }
+    # v1.4.2 debug emit
+    print(f"[backtest-debug] PARABOLIC_BLOCK fires: {debug['parabolic_total']}, "
+          f"of which spy_ret_60d available: {debug['parabolic_with_spy60d']}, "
+          f"should fire RECOVERY: {debug['parabolic_recov_should_fire']}, "
+          f"CRISIS: {debug['parabolic_crisis_should_fire']}")
+    if debug["spy60d_none_dates_sample"]:
+        print(f"[backtest-debug] Sample dates where parabolic fired but spy_ret_60d was None: "
+              f"{debug['spy60d_none_dates_sample']}")
     return stats, fires_per_ticker, baseline, investigation
 
 
