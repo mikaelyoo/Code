@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.7.5 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7.6 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -196,30 +196,83 @@ BRIDGE_URL   = os.environ.get("BRIDGE_URL", "http://localhost:8765")
 BRIDGE_TOKEN = os.environ.get("JARVIS_BRIDGE_TOKEN", "")
 USE_BRIDGE   = os.environ.get("USE_BRIDGE", "1") == "1"
 
-def fetch_bars_via_bridge(symbol):
-    """Fetch bars from Jarvis bridge instead of direct IBKR connection.
+# v1.7.6: bridge upgraded to streamable-HTTP MCP transport which requires
+# Mcp-Session-Id header on every tools/call. Get it from initialize.
+_BRIDGE_SESSION = None
 
-    v1.7.5: payload now includes jsonrpc/id required by the bridge's
-    pydantic JSON-RPC 2.0 validation. The pre-v1.7.5 form returned 400
-    Bad Request silently (urlopen raises HTTPError on 4xx, the except
-    clause below swallows it, function returns []). All bridge fetches
-    had been silently failing — every ticker showed "insufficient data".
-    """
-    payload = json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": "fetch_bars", "arguments": {"symbol": symbol}}
+def _bridge_session():
+    """Lazy-handshake the bridge and cache the session ID for the rest of
+    this process. Returns None on failure; callers should degrade gracefully."""
+    global _BRIDGE_SESSION
+    if _BRIDGE_SESSION is not None:
+        return _BRIDGE_SESSION
+    init = json.dumps({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "femisagent", "version": "1.7.6"},
+        },
     }).encode()
     req = _urllib_req.Request(
-        f"{BRIDGE_URL}/mcp",
-        data=payload,
+        f"{BRIDGE_URL}/mcp", data=init, method="POST",
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {BRIDGE_TOKEN}",
-            "Accept": "application/json, text/event-stream"
+            "Accept": "application/json, text/event-stream",
         },
-        method="POST"
+    )
+    try:
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            sid = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id")
+            r.read()  # drain
+        if sid:
+            _BRIDGE_SESSION = sid
+            # Send required "initialized" notification (MCP spec) so server
+            # transitions out of init state and accepts subsequent calls.
+            try:
+                notify = json.dumps({
+                    "jsonrpc": "2.0", "method": "notifications/initialized"
+                }).encode()
+                nreq = _urllib_req.Request(
+                    f"{BRIDGE_URL}/mcp", data=notify, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {BRIDGE_TOKEN}",
+                        "Mcp-Session-Id": sid,
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                _urllib_req.urlopen(nreq, timeout=5).read()
+            except Exception:
+                pass  # notification is best-effort
+    except Exception as e:
+        print(f"[femisagent] WARN: bridge MCP init failed: {e}")
+    return _BRIDGE_SESSION
+
+
+def fetch_bars_via_bridge(symbol):
+    """Fetch bars from Jarvis bridge instead of direct IBKR connection.
+
+    v1.7.6: now does the MCP session handshake (initialize → cache
+    Mcp-Session-Id → use it on every tools/call). The bridge upgraded
+    to streamable-HTTP transport mid-session; older one-shot calls now
+    return 400 "Missing session ID".
+    """
+    session = _bridge_session()
+    payload = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "fetch_bars", "arguments": {"symbol": symbol}},
+    }).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BRIDGE_TOKEN}",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = _urllib_req.Request(
+        f"{BRIDGE_URL}/mcp", data=payload, headers=headers, method="POST"
     )
     try:
         with _urllib_req.urlopen(req, timeout=30) as r:
@@ -610,7 +663,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.7.5 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7.6 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
