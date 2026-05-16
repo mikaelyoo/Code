@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.3 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.4 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -16,8 +16,20 @@ rows lack price/ret_20d_pct/vol_ratio fields.
 v1.3: signal_verdict() thresholds rescaled to match yfinance-derived EV
 distribution (run id=6 onwards). Old 80/30/0 were calibrated to v3.8's
 hardcoded avg_ret values up to +123%. New backtest data at 60td horizon
-caps EV around +12, so thresholds become 10/5/0. EXECUTE / BUY / WATCH /
-AVOID semantics preserved; just rescaled to the empirical distribution.
+caps EV around +12, so thresholds become 10/5/0.
+
+v1.4: ev_score() now uses excess_ret_pct (avg_ret_pct minus unconditional
+baseline ret_pct) when present in the calibration row — i.e. flag's
+edge OVER coin-flip entry into the same universe at the same horizon, not
+raw return. Two flags can have identical raw EV but very different excess
+EV — the raw scorer was systematically rewarding flags that just rode the
+universe trend. Live agent now ranks on the edge metric.
+
+Thresholds rescaled again to match the excess distribution (typically
+caps at +8 excess): EXECUTE >= 4, BUY >= 2, WATCH >= 0, AVOID < 0.
+
+Backward compat: if the loaded row has no excess_ret_pct field (id 1-5),
+falls back to legacy win_rate * avg_ret scoring.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
@@ -79,12 +91,17 @@ def load_latest_calibration():
                 flag_arr = row.get("flag_stats") or []
                 new_stats = {}
                 for i, f in enumerate(flag_arr, 1):
-                    new_stats[f["flag"]] = {
+                    entry = {
                         "win_rate": float(f["win_rate_pct"]) / 100.0,
                         "avg_ret":  float(f["avg_ret_pct"]),
                         "priority": i,
                         "n":        int(f.get("n", 0)),
                     }
+                    if f.get("excess_ret_pct") is not None:
+                        entry["excess_ret"] = float(f["excess_ret_pct"])
+                    if f.get("excess_wr_pct") is not None:
+                        entry["excess_wr"] = float(f["excess_wr_pct"])
+                    new_stats[f["flag"]] = entry
                 if new_stats:
                     FLAG_STATS = new_stats
                     CALIBRATION_SOURCE = f"supabase-run-id={row['id']}"
@@ -130,14 +147,19 @@ def load_latest_calibration():
 
 
 def ev_score(flag):
+    """v1.4: prefer baseline-adjusted excess_ret when available, fall back
+    to raw win_rate * avg_ret for legacy rows (id 1-5)."""
     s = FLAG_STATS.get(flag, {})
+    if "excess_ret" in s:
+        return round(s["excess_ret"], 1)
     return round(s.get("win_rate", 0) * s.get("avg_ret", 0), 1)
 
 def signal_verdict(flag):
+    """v1.4: thresholds rescaled for excess EV distribution (typically -3..+8)."""
     ev = ev_score(flag)
-    if ev >= 10:  return "🟢 EXECUTE"
-    if ev >= 5:   return "🟢 BUY"
-    if ev >= 0:   return "🟡 WATCH"
+    if ev >= 4:  return "🟢 EXECUTE"
+    if ev >= 2:  return "🟢 BUY"
+    if ev >= 0:  return "🟡 WATCH"
     return "🔴 AVOID"
 
 
@@ -279,8 +301,11 @@ def compute_flags(bars):
     if ret_5d < -0.02 and ret_10d > 0.05:
         flags.append("HRT_REVERSAL_RISK")
 
-    pos = [f for f in flags if FLAG_STATS.get(f, {}).get("avg_ret", 0) > 0]
-    neg = [f for f in flags if FLAG_STATS.get(f, {}).get("avg_ret", 0) <= 0]
+    def _edge(f):
+        s = FLAG_STATS.get(f, {})
+        return s["excess_ret"] if "excess_ret" in s else s.get("avg_ret", 0)
+    pos = [f for f in flags if _edge(f) > 0]
+    neg = [f for f in flags if _edge(f) <= 0]
     pos.sort(key=lambda f: FLAG_STATS[f]["priority"])
     neg.sort(key=lambda f: FLAG_STATS[f]["priority"])
 
@@ -394,14 +419,14 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.3 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.4 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
     categories = [
-        ("🟢 EXECUTE",  lambda r: r["ev_score"] >= 10),
-        ("🟢 BUY",      lambda r: 5 <= r["ev_score"] < 10),
-        ("🟡 WATCH",    lambda r: 0 <= r["ev_score"] < 5),
+        ("🟢 EXECUTE",  lambda r: r["ev_score"] >= 4),
+        ("🟢 BUY",      lambda r: 2 <= r["ev_score"] < 4),
+        ("🟡 WATCH",    lambda r: 0 <= r["ev_score"] < 2),
         ("🔴 AVOID",    lambda r: r["ev_score"] < 0),
         ("⚪ SKIP",     lambda r: r["ev_score"] == 0 and r["flag"] in ["NO_DATA","NEUTRAL","INSUFFICIENT_DATA"]),
     ]
@@ -425,9 +450,9 @@ def print_report(results):
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
-          f"Execute: {sum(1 for r in results if r['ev_score'] >= 10)} | "
-          f"Buy: {sum(1 for r in results if 5 <= r['ev_score'] < 10)} | "
-          f"Watch: {sum(1 for r in results if 0 <= r['ev_score'] < 5)} | "
+          f"Execute: {sum(1 for r in results if r['ev_score'] >= 4)} | "
+          f"Buy: {sum(1 for r in results if 2 <= r['ev_score'] < 4)} | "
+          f"Watch: {sum(1 for r in results if 0 <= r['ev_score'] < 2)} | "
           f"Avoid: {sum(1 for r in results if r['ev_score'] < 0)}")
     print("="*80 + "\n")
 
@@ -439,9 +464,9 @@ def print_report(results):
             "signals": results,
             "summary": {
                 "total": len(results),
-                "execute": sum(1 for r in results if r["ev_score"] >= 10),
-                "buy": sum(1 for r in results if 5 <= r["ev_score"] < 10),
-                "watch": sum(1 for r in results if 0 <= r["ev_score"] < 5),
+                "execute": sum(1 for r in results if r["ev_score"] >= 4),
+                "buy": sum(1 for r in results if 2 <= r["ev_score"] < 4),
+                "watch": sum(1 for r in results if 0 <= r["ev_score"] < 2),
                 "avoid": sum(1 for r in results if r["ev_score"] < 0),
             }
         }, f, indent=2)
