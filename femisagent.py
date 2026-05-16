@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.7 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.7.3 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -28,9 +28,16 @@ v1.7 — first cull + retry round:
                             allows co-firing as conviction overlay.
     VPIN_THRUST           — vpin>0.65 + ret_1d>1% + uptrend + vol>1.5;
                             "explosive buying with confirming flow."
-    SQUEEZE_RESOLVING_BULL — squeeze just broke (yesterday yes, today no)
-                            with bullish thrust. Catches the transition.
-    SQUEEZE_RESOLVING_BEAR — same transition, bearish direction.
+    SQUEEZE_RESOLVING_BULL  — squeeze just broke (yesterday yes, today no)
+                            + ret_1d > 1% + vol surge. Catches breakout.
+    SQUEEZE_RESOLVING_DOWN  — same transition, with ret_1d < -1%.
+                            Named "DOWN" (not "BEAR") because v1.7.2
+                            backtest showed +7.94% bull / +2.99% bear
+                            excess — i.e., even a small down-day after
+                            squeeze break still predicts POSITIVE forward
+                            returns. The squeeze-release itself is
+                            bullish in this universe regardless of which
+                            way the first bar resolves.
     OBV_THRUST            — obv_norm>0.30 + ret_20d>5% + ret_5d>0;
                             concurrent momentum across price + flow.
     PARABOLIC_RECOVERY    — parabolic AND SPY ret_60d > 0; isolates the
@@ -400,9 +407,12 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if bb_squeeze_yesterday and not bb_squeeze and ret_1d > 0.01 and vol_ratio > 1.5:
         flags.append("SQUEEZE_RESOLVING_BULL")
 
-    # SQUEEZE_RESOLVING_BEAR: opposite — bearish resolution.
+    # SQUEEZE_RESOLVING_DOWN: same transition with a down-day. Originally
+    # named "_BEAR" assuming this would be a bearish signal — backtest
+    # showed it's actually BULLISH (+7.94% bull, +2.99% bear excess).
+    # The squeeze-release energy is bullish regardless of immediate direction.
     if bb_squeeze_yesterday and not bb_squeeze and ret_1d < -0.01 and vol_ratio > 1.5:
-        flags.append("SQUEEZE_RESOLVING_BEAR")
+        flags.append("SQUEEZE_RESOLVING_DOWN")
 
     # OBV_THRUST: replaces OBV_BULL_DIVERGENCE. The original "OBV up while
     # price flat" hypothesis (accumulation) failed (-4.43% excess). v2:
@@ -579,7 +589,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.7 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.7.3 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
