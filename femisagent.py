@@ -1,36 +1,28 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.5 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.6 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
-v1.1: FLAG_STATS hot-loaded from Supabase public.femisapien_backtest_runs
-on startup (newest row), with offline cache fallback.
+v1.1: FLAG_STATS hot-loaded from Supabase.
+v1.2: lazy ib_insync import; print_report KeyError fix.
+v1.3: signal_verdict thresholds rescaled to 10/5/0.
+v1.4: ev_score uses excess_ret_pct; thresholds 4/2/0.
+v1.5: experimental HRT_STRONG_v2 / VPIN_PERSISTENT / SQUEEZE_PRE_BREAKOUT.
+      A/B backtest showed all three failed to beat their predecessors.
 
-v1.2: ib_insync import made lazy; print_report KeyError fix.
+v1.6: second-round experimental variants based on v1.5 lessons:
+  - HRT_STRONG_v3: BOTH absolute (ret_20d > 10%) AND relative-strength
+    (ret_20d > SPY + 10pp). v2's SPY+5pp turned out LOOSER than +10%
+    absolute in the bull regime — v3 makes it strictly tighter.
+  - OBV_BULL_DIVERGENCE / OBV_BEAR_DIVERGENCE: replace VPIN proxy with
+    On-Balance-Volume divergence vs price. Different concept entirely —
+    detects accumulation (OBV up while price flat) and distribution
+    (OBV flat/down while price up).
+  - SQUEEZE_BULLISH / SQUEEZE_BEARISH: add MACD-histogram bias filter
+    to squeeze. Doesn't just fire on compression — fires with direction.
 
-v1.3: signal_verdict thresholds rescaled to 10/5/0 for run id=6+.
-
-v1.4: ev_score uses excess_ret_pct (baseline-adjusted edge) when present;
-thresholds rescaled again to 4/2/0 for the excess distribution.
-
-v1.5: compute_flags adds three experimental flag variants for A/B
-comparison against the original definitions. New flags fire alongside
-old ones; both populate flag_stats in the next backtest so we can rank
-edges and decide which to keep in v1.6:
-  - HRT_STRONG_v2: requires ret_20d > SPY_ret_20d + 5pp (relative-strength
-    leader gate). Replaces "any uptrend" with "uptrend that beats the
-    market by a meaningful margin."
-  - VPIN_PERSISTENT: requires up-volume share > 0.55 for 5 consecutive
-    sessions (not just current snapshot). Filters one-day spikes.
-  - SQUEEZE_PRE_BREAKOUT: fires DURING compression (-2% < ret_5d < +2%
-    AND vol_ratio < 0.9), not after. Catches setups before they break
-    instead of chasing post-breakout reversion.
-
-compute_flags() now accepts an optional spy_ret_20d parameter; when None
-(legacy callers), the v2 flag falls back gracefully (doesn't fire). The
-backtest pre-fetches SPY and passes per-bar value; live femisagent.py
-fetches SPY 20d return once per scan.
+All new flags fire alongside existing ones. The next backtest A/Bs them.
 """
 import asyncio, json, sys, argparse, os
 import urllib.request as _urllib_req
@@ -280,6 +272,40 @@ def compute_flags(bars, spy_ret_20d=None):
                 vpins_recent.append(up_w / tot)
     vpin_persistent_bull = len(vpins_recent) == 5 and all(v > 0.55 for v in vpins_recent)
 
+    # v1.6: OBV (On-Balance-Volume) for divergence detection.
+    # Running cumulative: +volume on up-close days, -volume on down-close days.
+    obv_series = [0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:
+            obv_series.append(obv_series[-1] + volumes[i])
+        elif closes[i] < closes[i-1]:
+            obv_series.append(obv_series[-1] - volumes[i])
+        else:
+            obv_series.append(obv_series[-1])
+    vol_20d_total = sum(volumes[-20:])
+    if len(obv_series) >= 21 and vol_20d_total > 0:
+        obv_normalized = (obv_series[-1] - obv_series[-21]) / vol_20d_total
+    else:
+        obv_normalized = 0.0
+
+    # v1.6: MACD histogram (12/26/9 EMAs of close).
+    macd_hist = 0.0
+    if len(closes) >= 35:
+        k12, k26, k9 = 2.0/13, 2.0/27, 2.0/10
+        e12 = sum(closes[:12]) / 12
+        e26 = sum(closes[:26]) / 26
+        macd_vals = []
+        for i in range(12, len(closes)):
+            e12 = closes[i] * k12 + e12 * (1 - k12)
+            if i >= 26:
+                e26 = closes[i] * k26 + e26 * (1 - k26)
+                macd_vals.append(e12 - e26)
+        if len(macd_vals) >= 9:
+            sig = sum(macd_vals[:9]) / 9
+            for v in macd_vals[9:]:
+                sig = v * k9 + sig * (1 - k9)
+            macd_hist = macd_vals[-1] - sig
+
     flags = []
 
     if vol_ratio >= 2.5 and ret_1d > 0.01 and uptrend:
@@ -342,6 +368,37 @@ def compute_flags(bars, spy_ret_20d=None):
     # i.e. before the breakout, not after.
     if bb_squeeze and -0.02 < ret_5d < 0.02 and vol_ratio < 0.9:
         flags.append("SQUEEZE_PRE_BREAKOUT")
+
+    # ── v1.6 experimental flag variants ──────────────────────────────────
+    # v1.5's three new flags all failed to beat predecessors in the A/B.
+    # v1.6 retries with tighter / structurally-different conditions.
+
+    # HRT_STRONG_v3: BOTH absolute (>10%) AND relative-strength (>SPY+10pp).
+    # v2 was looser than the original because SPY+5pp was usually < 10%
+    # absolute. v3 requires BOTH thresholds — strictly tighter than either.
+    if spy_ret_20d is not None:
+        if uptrend and ret_20d > 0.10 and ret_20d > spy_ret_20d + 0.10 and ret_5d > 0:
+            if "MOMENTUM_SURGE" not in flags and "MOMENTUM_CONTINUATION" not in flags:
+                flags.append("HRT_STRONG_v3")
+
+    # OBV divergence — accumulation/distribution detection.
+    # Bullish: price flat/down but volume biased upward (smart-money buying
+    # under cover of stagnation).
+    # Bearish: price up but volume neutral/negative (rally without conviction,
+    # potentially distribution into strength).
+    if obv_normalized > 0.20 and ret_20d < 0.02:
+        flags.append("OBV_BULL_DIVERGENCE")
+    if obv_normalized < 0.0 and ret_20d > 0.05:
+        flags.append("OBV_BEAR_DIVERGENCE")
+
+    # SQUEEZE + MACD directional bias. Fires near-flat price during a
+    # squeeze, conditional on MACD histogram direction. Two opposite
+    # signals from the same setup.
+    if bb_squeeze and -0.05 < ret_5d < 0.05:
+        if macd_hist > 0:
+            flags.append("SQUEEZE_BULLISH")
+        elif macd_hist < 0:
+            flags.append("SQUEEZE_BEARISH")
 
     def _edge(f):
         s = FLAG_STATS.get(f, {})
@@ -470,7 +527,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.5 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.6 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT_BACKTEST v1.2 — yfinance-based historical backtest → Supabase.
+FEMISAGENT_BACKTEST v1.3 — yfinance-based historical backtest → Supabase.
 
-v1.2 adds per-bar SPY ret_20d baseline pass-through to compute_flags so
-the v1.5 HRT_STRONG_v2 (relative-strength gate) can fire in backtest. SPY
-fetched once at the top, indexed by date, looked up per (ticker, bar).
-Also adds the v1.5 experimental flags to the per-flag stats output.
+v1.2 added per-bar SPY ret_20d pass-through for HRT_STRONG_v2.
+
+v1.3 adds --investigate-flag FLAG_NAME for deep-dive analysis on a single
+flag. Records per-fire (ticker, date, year, fwd_ret, max_drawdown_during)
+and emits per-year stratification + top-ticker breakdown + return
+distribution percentiles. Used to understand WHY a flag has the edge it
+has (e.g. PARABOLIC_BLOCK: is the +17% bear excess concentrated in 2009
+recovery? Concentrated in a few names? What's the worst-case drawdown?).
 
 Pulls daily bars via yfinance for a watchlist over a date range, slides
 compute_flags() (imported from femisagent.py) across each ticker's history,
@@ -107,19 +111,20 @@ def _df_to_bars(sub):
     return bars
 
 
-def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90, spy_ret_20d_by_date=None):
+def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90,
+                 spy_ret_20d_by_date=None, investigate_flag=None):
     """For each ticker, slide a window, compute flags, measure forward returns.
 
-    Returns (stats, fires_per_ticker, baseline) where:
-        stats     = {flag: {n, win_rate_pct, avg_ret_pct, excess_ret_pct, excess_wr_pct}}
-        baseline  = {n, win_rate_pct, avg_ret_pct}  # unconditional forward return
-
-    v1.2: spy_ret_20d_by_date (date_str -> float) is passed per-bar to
-    compute_flags so HRT_STRONG_v2 can fire with the right benchmark.
+    Returns (stats, fires_per_ticker, baseline, investigation) where:
+        stats         = {flag: {n, win_rate_pct, avg_ret_pct, excess_ret_pct, excess_wr_pct}}
+        baseline      = {n, win_rate_pct, avg_ret_pct}
+        investigation = [] or list of {sym, date, year, fwd_ret, max_dd_pct}
+                        for every fire of investigate_flag.
     """
     flag_returns = {}
     all_window_returns = []
     fires_per_ticker = {}
+    investigation = []
     for sym, bars in bars_by_ticker.items():
         if len(bars) < lookback_bars + horizon_days + 5:
             continue
@@ -138,6 +143,18 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90, spy_ret_20d_
                     continue
                 flag_returns.setdefault(flag, []).append(ret)
                 fires_per_ticker[sym] += 1
+            if investigate_flag and investigate_flag in flags:
+                # Max drawdown during the forward window (i .. i+horizon)
+                fwd_closes = [b.close for b in bars[i: i + horizon_days + 1]]
+                min_close = min(fwd_closes)
+                max_dd = (min_close / entry - 1) * 100.0
+                investigation.append({
+                    "sym": sym,
+                    "date": bars[i].date,
+                    "year": bars[i].date[:4],
+                    "fwd_ret": ret,
+                    "max_dd_pct": max_dd,
+                })
 
     n_baseline = len(all_window_returns)
     if n_baseline > 0:
@@ -165,7 +182,7 @@ def run_backtest(bars_by_ticker, horizon_days=60, lookback_bars=90, spy_ret_20d_
             "excess_ret_pct": round(avg_ret - baseline["avg_ret_pct"], 2),
             "excess_wr_pct": round(wr_pct - baseline["win_rate_pct"], 1),
         }
-    return stats, fires_per_ticker, baseline
+    return stats, fires_per_ticker, baseline, investigation
 
 
 def wilson_lower(p, n, z=1.96):
@@ -310,6 +327,8 @@ def main():
     p.add_argument("--min-wilson-lower", type=float, default=0.5)
     p.add_argument("--version-tag", default=None)
     p.add_argument("--dry-run", action="store_true", help="Don't POST to Supabase")
+    p.add_argument("--investigate-flag", default=None,
+                   help="Emit deep-dive analysis (per-year, top tickers, return distribution + max drawdown) for one flag")
     args = p.parse_args()
 
     if not args.version_tag:
@@ -336,9 +355,10 @@ def main():
         spy_ret_20d_by_date[spy_bars[i].date] = (spy_bars[i].close / spy_bars[i-20].close) - 1
     print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates with ret_20d available")
 
-    stats, fires_per_ticker, baseline = run_backtest(
+    stats, fires_per_ticker, baseline, investigation = run_backtest(
         bars, horizon_days=args.horizon, lookback_bars=args.lookback,
         spy_ret_20d_by_date=spy_ret_20d_by_date,
+        investigate_flag=args.investigate_flag,
     )
     print(
         f"[backtest] Unconditional baseline: "
@@ -375,6 +395,54 @@ def main():
                     f"  {d['flag']:<28} reason={d['reason']:<24} "
                     f"prev_WR={d['prev_wr_pct']:>5.1f}% prev_avg_ret={d['prev_avg_ret_pct']:>+7.2f}%"
                 )
+
+    if args.investigate_flag:
+        print(f"\n[backtest] === Investigation: {args.investigate_flag} ===")
+        if not investigation:
+            print(f"  No fires of {args.investigate_flag} in this sample.")
+        else:
+            n_all = len(investigation)
+            rets_sorted = sorted(r["fwd_ret"] for r in investigation)
+            dds_sorted  = sorted(r["max_dd_pct"] for r in investigation)
+            print(f"Overall fwd_ret distribution (n={n_all}):")
+            for label, idx in [("min", 0), ("p10", n_all // 10), ("p25", n_all // 4),
+                               ("med", n_all // 2), ("p75", 3 * n_all // 4),
+                               ("p90", 9 * n_all // 10), ("max", n_all - 1)]:
+                print(f"  {label:>4}: fwd_ret={rets_sorted[idx]:+7.2f}%  max_dd={dds_sorted[idx]:+7.2f}%")
+            neg = sum(1 for r in rets_sorted if r < 0)
+            print(f"  Negative fwd_ret fraction: {neg / n_all * 100:.1f}% ({neg}/{n_all})")
+            avg_dd = sum(r["max_dd_pct"] for r in investigation) / n_all
+            worst_dd = min(r["max_dd_pct"] for r in investigation)
+            print(f"  avg max_dd_during_window: {avg_dd:+.2f}%   worst: {worst_dd:+.2f}%")
+
+            print(f"\nPer-year breakdown:")
+            by_year = {}
+            for r in investigation:
+                by_year.setdefault(r["year"], []).append(r)
+            for year in sorted(by_year):
+                rs = by_year[year]
+                n = len(rs)
+                rets = sorted(r["fwd_ret"] for r in rs)
+                avg = sum(rets) / n
+                med = rets[n // 2]
+                p25 = rets[max(0, n // 4)]
+                p75 = rets[min(n - 1, 3 * n // 4)]
+                avg_dd = sum(r["max_dd_pct"] for r in rs) / n
+                worst_dd = min(r["max_dd_pct"] for r in rs)
+                print(f"  {year}: n={n:<4} avg={avg:+6.2f}% med={med:+6.2f}% "
+                      f"p25={p25:+6.2f}% p75={p75:+6.2f}% "
+                      f"avg_dd={avg_dd:+6.2f}% worst_dd={worst_dd:+6.2f}%")
+
+            print(f"\nTop 10 tickers by fire count:")
+            by_ticker = {}
+            for r in investigation:
+                by_ticker.setdefault(r["sym"], []).append(r)
+            for sym, rs in sorted(by_ticker.items(), key=lambda x: -len(x[1]))[:10]:
+                rets = [r["fwd_ret"] for r in rs]
+                dds  = [r["max_dd_pct"] for r in rs]
+                print(f"  {sym:<6} n={len(rs):<4} avg_fwd={sum(rets)/len(rets):+6.2f}% "
+                      f"avg_dd={sum(dds)/len(dds):+6.2f}%")
+        print()
 
     payload = build_payload(args.version_tag, period_label, args.tickers, stats, demoted, args, baseline=baseline)
 
