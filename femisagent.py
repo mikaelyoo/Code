@@ -33,10 +33,12 @@ v1.7 — first cull + retry round:
     SQUEEZE_RESOLVING_BEAR — same transition, bearish direction.
     OBV_THRUST            — obv_norm>0.30 + ret_20d>5% + ret_5d>0;
                             concurrent momentum across price + flow.
-    PARABOLIC_RECOVERY    — parabolic AND spy 60d drawdown < -8%;
-                            isolates the 2009-style and 2023-style
-                            recovery-from-correction sub-regime where
-                            PARABOLIC_BLOCK actually has edge.
+    PARABOLIC_RECOVERY    — parabolic AND SPY ret_60d > 0; isolates the
+                            2009-style / 2023+ recovery sub-regime where
+                            PARABOLIC_BLOCK has its strongest edge.
+    PARABOLIC_CRISIS      — parabolic AND SPY ret_60d <= 0; suspected
+                            dead-cat-bounce regime (negative excess
+                            expected). Validates the regime hypothesis.
 
   Backtest v1.4 also fixes the Wilson-CI demote rule: was demoting on
   Wilson_lower<0.5 alone, killing fat-tail-positive flags like
@@ -409,13 +411,25 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if obv_normalized > 0.30 and ret_20d > 0.05 and ret_5d > 0:
         flags.append("OBV_THRUST")
 
-    # PARABOLIC_RECOVERY: refines PARABOLIC_BLOCK by gating on SPY drawdown.
-    # Per-year breakdown showed PARABOLIC_BLOCK's edge concentrates in
-    # post-crash recovery years (2009 / 2023+) and loses money in
-    # peak-bull years (2021 / 2008-crisis). The gate "SPY 60d drawdown
-    # < -8%" approximates the recovery sub-regime.
-    if parabolic and spy_60d_dd_pct is not None and spy_60d_dd_pct < -0.08:
+    # PARABOLIC_RECOVERY: refines PARABOLIC_BLOCK by gating on regime.
+    # v1.7 first attempt used "SPY 60d-drawdown < -8%" — that fired 0 times
+    # because PARABOLIC (stock +40% in 20d) and "SPY currently 8%+ below 60d
+    # high" are time-opposites: when SPY is deeply down, stocks are too;
+    # when stocks go parabolic, SPY has usually already recovered enough
+    # that 60d-drawdown isn't < -8% anymore.
+    #
+    # v1.7.1: redefine to "SPY ret_60d > 0" — i.e., the parabolic move
+    # happens during a recovering market, not a still-falling one.
+    # Filters 2008-style dead-cat-bounce fires (SPY still falling) from
+    # 2009 / 2023+ real-recovery fires (SPY net positive over 60d).
+    if parabolic and spy_ret_60d is not None and spy_ret_60d > 0:
         flags.append("PARABOLIC_RECOVERY")
+
+    # PARABOLIC_CRISIS: opposite half — parabolic move WHILE SPY still
+    # falling. Expected to be dead-cat bounces with negative forward
+    # return. If this fires negative, confirms the regime hypothesis.
+    if parabolic and spy_ret_60d is not None and spy_ret_60d <= 0:
+        flags.append("PARABOLIC_CRISIS")
 
     def _edge(f):
         s = FLAG_STATS.get(f, {})
