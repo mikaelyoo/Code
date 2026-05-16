@@ -381,6 +381,16 @@ def main():
     print(f"[backtest] SPY benchmark: {len(spy_ret_20d_by_date)} dates w/ ret_20d, "
           f"{len(spy_ret_60d_by_date)} w/ ret_60d + 60d-drawdown")
 
+    # Debug: how often does SPY 60d-drawdown go below -8% in this sample?
+    deep_dd = [(d, v) for d, v in spy_60d_dd_by_date.items() if v < -0.08]
+    all_dd_vals = list(spy_60d_dd_by_date.values())
+    min_dd = min(all_dd_vals) if all_dd_vals else 0.0
+    print(f"[backtest] SPY dates with 60d-drawdown < -8%: {len(deep_dd)} "
+          f"(min observed: {min_dd:.3f})")
+    if deep_dd:
+        sample = sorted(deep_dd, key=lambda x: x[1])[:3]
+        print(f"  worst 3: {sample}")
+
     stats, fires_per_ticker, baseline, investigation = run_backtest(
         bars, horizon_days=args.horizon, lookback_bars=args.lookback,
         spy_ret_20d_by_date=spy_ret_20d_by_date,
