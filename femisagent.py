@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.8.2 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.9 — Live FEMISAPIEN v3.8 Signal Scanner
+
+v1.9 fixes three gaps surfaced by the head-to-head vs femisaalpha_runner v3.8
+(2026-05-18, 9-ticker scan TSLA NVDA AMD MU GOOGL AAOI VPG HIMS HOOD):
+
+  EARNINGS_BLOCK   — v3.8 caught NVDA entering 2 days before earnings;
+                     v1.8.2 had no calendar gate. v1.9 fetches earnings_dte
+                     via yfinance.Ticker.calendar (24h cache) and demotes any
+                     signal with dte<=5 to WATCH.
+  PARABOLIC cap    — backtest showed PARABOLIC_BLOCK is fat-tailed (high
+                     avg_ret, ~52% WR). v3.8 sees the same exhaustion and
+                     HOLDs; we were sizing it as EXECUTE at EV=9.2. v1.9
+                     caps PARABOLIC_BLOCK verdict at BUY regardless of EV.
+  BENEISH_RISK     — v3.8 caught HOOD at M=27.32 (extreme accruals); v1.8.2
+                     has no fundamental layer. v1.9 computes Beneish M-Score
+                     from yfinance financials (30d cache) and demotes any
+                     signal where M > -1.78.
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -415,6 +431,142 @@ def _atr(highs, lows, closes, period=14):
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
+
+# ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
+
+_FUND_CACHE_PATH = "/data/.openclaw/workspace/memory/femisagent_fundamentals.cache.json"
+_FUND_CACHE = None
+
+def _load_fund_cache():
+    global _FUND_CACHE
+    if _FUND_CACHE is not None:
+        return _FUND_CACHE
+    try:
+        with open(_FUND_CACHE_PATH) as f:
+            _FUND_CACHE = json.load(f)
+    except Exception:
+        _FUND_CACHE = {}
+    return _FUND_CACHE
+
+def _save_fund_cache():
+    if _FUND_CACHE is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(_FUND_CACHE_PATH), exist_ok=True)
+        with open(_FUND_CACHE_PATH, "w") as f:
+            json.dump(_FUND_CACHE, f, indent=2)
+    except Exception:
+        pass
+
+def _yf():
+    """Lazy yfinance import. Returns None if not installed."""
+    try:
+        import yfinance as yf
+        return yf
+    except ImportError:
+        return None
+
+def get_earnings_dte(symbol):
+    """Days to next earnings via yfinance. 24h cache. None if unknown."""
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    now_ts = datetime.now().timestamp()
+    if entry.get("earnings_fetched_at", 0) > now_ts - 86400:
+        return entry.get("earnings_dte")
+    yf = _yf()
+    if yf is None:
+        return None
+    dte = None
+    try:
+        cal = yf.Ticker(symbol).calendar
+        ed = None
+        if isinstance(cal, dict):
+            v = cal.get("Earnings Date")
+            ed = v[0] if isinstance(v, list) and v else v
+        elif cal is not None and hasattr(cal, "empty") and not cal.empty:
+            ed = cal.iloc[0, 0]
+        if ed is not None:
+            if hasattr(ed, "to_pydatetime"):
+                ed = ed.to_pydatetime()
+            if hasattr(ed, "year") and not isinstance(ed, datetime):
+                ed = datetime(ed.year, ed.month, ed.day)
+            if isinstance(ed, str):
+                ed = datetime.fromisoformat(ed[:10])
+            if isinstance(ed, datetime):
+                dte = (ed - datetime.now()).days
+    except Exception:
+        pass
+    entry["earnings_dte"] = dte
+    entry["earnings_fetched_at"] = now_ts
+    _save_fund_cache()
+    return dte
+
+def get_beneish_m(symbol):
+    """Beneish M-Score from yfinance financials. 30d cache. None if data insufficient.
+    M > -1.78 = elevated manipulation/accruals risk."""
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    now_ts = datetime.now().timestamp()
+    if entry.get("beneish_fetched_at", 0) > now_ts - 30 * 86400:
+        return entry.get("beneish_m")
+    yf = _yf()
+    if yf is None:
+        return None
+    m_score = None
+    try:
+        t = yf.Ticker(symbol)
+        bs, is_, cf = t.balance_sheet, t.income_stmt, t.cashflow
+        if bs is None or is_ is None or cf is None:
+            raise ValueError("missing statements")
+        if bs.shape[1] < 2 or is_.shape[1] < 2 or cf.shape[1] < 2:
+            raise ValueError("need 2yr data")
+
+        def pick(df, *keys):
+            for k in keys:
+                if k in df.index:
+                    return float(df.loc[k].iloc[0]), float(df.loc[k].iloc[1])
+            return None, None
+
+        rec_t, rec_p = pick(bs, "Receivables", "Accounts Receivable")
+        sales_t, sales_p = pick(is_, "Total Revenue", "Operating Revenue")
+        cogs_t, cogs_p = pick(is_, "Cost Of Revenue", "Cost Of Goods Sold")
+        ca_t, ca_p = pick(bs, "Current Assets", "Total Current Assets")
+        ppe_t, ppe_p = pick(bs, "Net PPE", "Property Plant Equipment Net")
+        ta_t, ta_p = pick(bs, "Total Assets")
+        dep_t, dep_p = pick(cf, "Depreciation And Amortization", "Depreciation")
+        sga_t, sga_p = pick(is_, "Selling General And Administration", "Selling General Administrative")
+        ni_t, ni_p = pick(is_, "Net Income", "Net Income Common Stockholders")
+        ocf_t, _ = pick(cf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+        tl_t, tl_p = pick(bs, "Total Liabilities Net Minority Interest", "Total Liab")
+
+        req = [rec_t, rec_p, sales_t, sales_p, cogs_t, cogs_p,
+               ca_t, ca_p, ppe_t, ppe_p, ta_t, ta_p,
+               sga_t, sga_p, ni_t, ni_p, tl_t, tl_p]
+        if any(v is None or v == 0 for v in [sales_t, sales_p, ta_t, ta_p, rec_p]):
+            raise ValueError("zero denominator")
+        if any(v is None for v in req):
+            raise ValueError("missing field")
+
+        DSRI = (rec_t / sales_t) / (rec_p / sales_p)
+        GMI  = ((sales_p - cogs_p) / sales_p) / ((sales_t - cogs_t) / sales_t)
+        AQI  = (1 - (ca_t + ppe_t) / ta_t) / (1 - (ca_p + ppe_p) / ta_p)
+        SGI  = sales_t / sales_p
+        DEPI = ((dep_p / (dep_p + ppe_p)) / (dep_t / (dep_t + ppe_t))
+                if dep_t and dep_p and (dep_p + ppe_p) and (dep_t + ppe_t) else 1.0)
+        SGAI = (sga_t / sales_t) / (sga_p / sales_p)
+        LVGI = (tl_t / ta_t) / (tl_p / ta_p)
+        TATA = (ni_t - (ocf_t or 0)) / ta_t
+        m_score = round(
+            -4.84 + 0.92*DSRI + 0.528*GMI + 0.404*AQI + 0.892*SGI
+            + 0.115*DEPI - 0.172*SGAI + 4.679*TATA - 0.327*LVGI, 2
+        )
+    except Exception:
+        pass
+    entry["beneish_m"] = m_score
+    entry["beneish_fetched_at"] = now_ts
+    _save_fund_cache()
+    return m_score
+
 
 # Set of flag names known to be bullish-tilted across past calibrations.
 # Used by MULTI_CONFLUENCE_* meta-flags to count concurring bullish signals.
@@ -853,6 +1005,32 @@ async def run(tickers=None, portfolio_mode=False):
             "verdict":    signal_verdict(primary),
             "bars":       len(bars),
         }
+
+        # v1.9 gate 1 — earnings calendar: demote if within 5 days
+        dte = get_earnings_dte(sym)
+        row["earnings_dte"] = dte
+        if dte is not None and 0 <= dte <= 5:
+            row["all_flags"].append("EARNINGS_BLOCK")
+            row["ev_score"] = min(row["ev_score"], 0.5)
+            row["verdict"] = "🟡 WATCH"
+            row["gate"] = f"EARNINGS_IN_{dte}D"
+
+        # v1.9 gate 2 — Beneish M-Score: demote if accruals/manipulation risk
+        m = get_beneish_m(sym)
+        row["beneish_m"] = m
+        if m is not None and m > -1.78:
+            row["all_flags"].append("BENEISH_RISK")
+            if row["ev_score"] >= 2:
+                row["ev_score"] = min(row["ev_score"], 0.5)
+                row["verdict"] = "🟡 WATCH"
+            row["gate"] = row.get("gate") or f"BENEISH_M={m}"
+
+        # v1.9 gate 3 — PARABOLIC cap: fat-tail flag, never EXECUTE-tier
+        if primary == "PARABOLIC_BLOCK" and row["ev_score"] >= 4:
+            row["ev_score"] = min(row["ev_score"], 3.5)
+            row["verdict"] = "🟢 BUY"
+            row["gate"] = row.get("gate") or "PARABOLIC_CAP"
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -860,7 +1038,8 @@ async def run(tickers=None, portfolio_mode=False):
             row["unreal_pct"] = round((c - pos["avgCost"]) / pos["avgCost"] * 100, 1) if pos["avgCost"] else 0
 
         results.append(row)
-        print(f"{primary} | EV={row['ev_score']} | {row['verdict']}")
+        gate_note = f" [{row['gate']}]" if row.get("gate") else ""
+        print(f"{primary} | EV={row['ev_score']} | {row['verdict']}{gate_note}")
         await asyncio.sleep(0.4)
 
     ib.disconnect()
@@ -869,7 +1048,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.8.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.9 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -904,6 +1083,15 @@ def print_report(results):
                       if f != r.get("flag") and f != r.get("flag2")]
             if extras:
                 print(f"           +flags: {', '.join(extras)}")
+            fund_bits = []
+            if r.get("earnings_dte") is not None:
+                fund_bits.append(f"earnings={r['earnings_dte']}d")
+            if r.get("beneish_m") is not None:
+                fund_bits.append(f"M={r['beneish_m']}")
+            if r.get("gate"):
+                fund_bits.append(f"gate={r['gate']}")
+            if fund_bits:
+                print(f"           {' | '.join(fund_bits)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
