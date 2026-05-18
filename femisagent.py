@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.8.1 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.8.2 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -8,13 +8,13 @@ v1.1: Supabase calibration hot-load.
 v1.2: lazy ib_insync; print_report KeyError fix.
 v1.3: thresholds 10/5/0.
 v1.4: excess_ret scoring; thresholds 4/2/0.
-v1.8.1 — win-rate lift: add RSI, ATR, trend-quality, parabolic-with-trend,
+v1.8.2 — win-rate lift: add RSI, ATR, trend-quality, parabolic-with-trend,
        and multi-confluence meta-flags.
 
        Diagnosis: id=8 lifted WR only +0.4pp over baseline (60.2% vs 59.8%);
        most of the system's edge was avg-return, not consistency. The
        PARABOLIC family is the worst WR offender (52% on +21% avg_ret —
-       fat-tailed). v1.8.1 adds:
+       fat-tailed). v1.8.2 adds:
 
          RSI_REVERSAL       — oversold cross (RSI<30 → RSI≥30 + green bar).
                               Classic high-WR pattern in trending universes.
@@ -221,7 +221,7 @@ BRIDGE_URL   = os.environ.get("BRIDGE_URL", "http://localhost:8765")
 BRIDGE_TOKEN = os.environ.get("JARVIS_BRIDGE_TOKEN", "")
 USE_BRIDGE   = os.environ.get("USE_BRIDGE", "1") == "1"
 
-# v1.8.1: bridge upgraded to streamable-HTTP MCP transport which requires
+# v1.8.2: bridge upgraded to streamable-HTTP MCP transport which requires
 # Mcp-Session-Id header on every tools/call. Get it from initialize.
 _BRIDGE_SESSION = None
 
@@ -279,7 +279,7 @@ def _bridge_session():
 def fetch_bars_via_bridge(symbol):
     """Fetch bars from Jarvis bridge instead of direct IBKR connection.
 
-    v1.8.1: now does the MCP session handshake (initialize → cache
+    v1.8.2: now does the MCP session handshake (initialize → cache
     Mcp-Session-Id → use it on every tools/call). The bridge upgraded
     to streamable-HTTP transport mid-session; older one-shot calls now
     return 400 "Missing session ID".
@@ -313,6 +313,58 @@ def fetch_bars_via_bridge(symbol):
         pass
     return []
 
+def get_positions_via_bridge():
+    """Fetch portfolio positions via the bridge's get_positions MCP tool.
+
+    Returns a list of (symbol, exchange, currency, qty, avgCost) tuples
+    matching the shape of get_portfolio_tickers() so the caller code in
+    run() is symmetric across bridge/direct paths.
+
+    v1.8.2: shipped to fix the long-standing --portfolio crash in bridge
+    mode. Previously the script called ib.reqPositionsAsync() on an
+    unconnected IB() client (bridge mode skips the IBKR handshake), so
+    --portfolio always raised ConnectionError. Now portfolio fetch goes
+    through the same MCP session that fetch_bars uses.
+    """
+    session = _bridge_session()
+    payload = json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "get_positions", "arguments": {}},
+    }).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BRIDGE_TOKEN}",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = _urllib_req.Request(
+        f"{BRIDGE_URL}/mcp", data=payload, headers=headers, method="POST"
+    )
+    try:
+        with _urllib_req.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                data = json.loads(line[5:].strip())
+                result = data.get("result", {})
+                content = result.get("content", [])
+                if content and content[0].get("type") == "text":
+                    positions_data = json.loads(content[0]["text"])
+                    out = []
+                    for pos in positions_data:
+                        sym = pos.get("symbol", "")
+                        exch = pos.get("exchange", "SMART")
+                        cur = pos.get("currency", "USD")
+                        qty = pos.get("qty") or pos.get("position") or 0
+                        cost = pos.get("avgCost") or pos.get("avg_cost") or 0
+                        if sym:
+                            out.append((sym, exch, cur, qty, cost))
+                    return out
+    except Exception as e:
+        print(f"[femisagent] WARN: bridge get_positions failed: {e}")
+    return []
+
 def make_bar_obj(d):
     class Bar:
         def __init__(self, row):
@@ -326,7 +378,7 @@ def make_bar_obj(d):
 
 # ── Technical flag engine ───────────────────────────────────────────────────
 
-# v1.8.1 indicator helpers
+# v1.8.2 indicator helpers
 def _rsi(closes, period=14):
     """Wilder's RSI. Returns 50 for insufficient data."""
     if len(closes) < period + 1:
@@ -374,7 +426,7 @@ _BULLISH_FLAGS = frozenset({
     "PARABOLIC_TRENDED", "HRT_REVERSAL_RISK", "GS_DISTRIB",
     "HRT_WEAK", "SQUEEZE_RESOLVING_BULL", "SQUEEZE_RESOLVING_DOWN",
     "OBV_THRUST", "VPIN_THRUST",
-    # v1.8.1.1 kept:
+    # v1.8.2.1 kept:
     "RSI_REVERSAL", "RSI_OVERBOUGHT_CONT", "ATR_BREAKOUT",
 })
 
@@ -593,7 +645,7 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         if "OBV_THRUST" in flags or "HRT_STRONG_v4" in flags:
             flags.append("PARABOLIC_CRISIS")
 
-    # ── v1.8.1 — new factors targeting win-rate lift ───────────────────────
+    # ── v1.8.2 — new factors targeting win-rate lift ───────────────────────
     # RSI, ATR computed once per call; cheap (linear over the window).
     rsi14 = _rsi(closes, 14)
     rsi_prev = _rsi(closes[:-1], 14) if len(closes) >= 16 else 50.0
@@ -601,7 +653,7 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
 
     # RSI_REVERSAL: classic oversold-bounce pattern. RSI crosses up
     # through 30 from below + today is a green bar.
-    # v1.8.1.1: gated on bull regime (spy_ret_60d > 0). Oversold bounces
+    # v1.8.2.1: gated on bull regime (spy_ret_60d > 0). Oversold bounces
     # work in trending bull markets; in bear regimes they're falling
     # knives. Bull: 69.0% WR / +5pp excess. Bear ungated: 49.5% WR /
     # -2.16% excess. Bull-gating preserves the win.
@@ -639,7 +691,7 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if bullish_count >= 3:
         flags.append("MULTI_CONFLUENCE_3")
 
-    # v1.8.1.1 dropped vs v1.8.1:
+    # v1.8.2.1 dropped vs v1.8.2:
     #   TREND_QUALITY    — fired on 47% of all bars, pure noise
     #   MULTI_CONFLUENCE_5 — -3.6pp bull WR vs baseline
     #   RSI_OVERBOUGHT  → renamed RSI_OVERBOUGHT_CONT (semantic fix)
@@ -715,15 +767,20 @@ async def run(tickers=None, portfolio_mode=False):
 
     portfolio_data = {}
     if portfolio_mode:
+        # v1.8.2: route portfolio fetch through bridge when bridge mode is
+        # active. Direct ib.reqPositionsAsync() requires a connected IB
+        # client; we never connect in bridge mode.
         if USE_BRIDGE and BRIDGE_TOKEN:
             print("Fetching portfolio via bridge...")
-        positions = await get_portfolio_tickers(ib)
+            positions = get_positions_via_bridge()
+        else:
+            positions = await get_portfolio_tickers(ib)
         for sym, exch, cur, qty, cost in positions:
             portfolio_data[sym] = {"qty": qty, "avgCost": cost}
         if not tickers:
             tickers = [p[0] for p in positions]
         else:
-            # v1.8.1: union — when both --portfolio and --tickers are given,
+            # v1.8.2: union — when both --portfolio and --tickers are given,
             # scan the watchlist AND add any held tickers not already in it.
             # Portfolio_data annotations still apply for held names.
             existing = set(tickers)
@@ -777,6 +834,13 @@ async def run(tickers=None, portfolio_mode=False):
         avg_vol = sum(b.volume for b in bars[-20:]) / 20
         vol_ratio = bars[-1].volume / avg_vol if avg_vol > 0 else 1.0
 
+        # v1.8.2: capture full flag list (not just primary/secondary) so
+        # the report can show all fires per ticker. Other v1.7+ flags
+        # (RSI_REVERSAL, MULTI_CONFLUENCE_3, RSI_OVERBOUGHT_CONT, ...)
+        # were firing invisibly before because the print/JSON only
+        # surfaced flags[0] and flags[1].
+        all_flags = [f for f in flags
+                     if f not in ("NEUTRAL", "INSUFFICIENT_DATA", "NO_DATA")]
         row = {
             "symbol":     sym,
             "price":      round(c, 2),
@@ -784,6 +848,7 @@ async def run(tickers=None, portfolio_mode=False):
             "vol_ratio":  round(vol_ratio, 2),
             "flag":       primary,
             "flag2":      secondary,
+            "all_flags":  all_flags,
             "ev_score":   ev_score(primary),
             "verdict":    signal_verdict(primary),
             "bars":       len(bars),
@@ -804,7 +869,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.8.1 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.8.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -832,6 +897,13 @@ def print_report(results):
                       f"vol={r['vol_ratio']:.1f}x | {r['flag']}{flag2}{pos_info}")
             else:
                 print(f"  {r['symbol']:<8} {r['flag']}{flag2}{pos_info}")
+            # v1.8.2: surface every additional flag that fired for this
+            # ticker (beyond primary/secondary) — confirms new v1.8 flags
+            # are actually contributing even when not top-tier.
+            extras = [f for f in r.get("all_flags", [])
+                      if f != r.get("flag") and f != r.get("flag2")]
+            if extras:
+                print(f"           +flags: {', '.join(extras)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
