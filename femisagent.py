@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.8 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.8.1 — Live FEMISAPIEN v3.8 Signal Scanner
 Connects to IBKR, pulls market data, applies flag logic, ranks signals.
 Usage: python3 femisagent.py [--tickers TSLA NVDA ...] [--portfolio]
 
@@ -8,13 +8,13 @@ v1.1: Supabase calibration hot-load.
 v1.2: lazy ib_insync; print_report KeyError fix.
 v1.3: thresholds 10/5/0.
 v1.4: excess_ret scoring; thresholds 4/2/0.
-v1.8 — win-rate lift: add RSI, ATR, trend-quality, parabolic-with-trend,
+v1.8.1 — win-rate lift: add RSI, ATR, trend-quality, parabolic-with-trend,
        and multi-confluence meta-flags.
 
        Diagnosis: id=8 lifted WR only +0.4pp over baseline (60.2% vs 59.8%);
        most of the system's edge was avg-return, not consistency. The
        PARABOLIC family is the worst WR offender (52% on +21% avg_ret —
-       fat-tailed). v1.8 adds:
+       fat-tailed). v1.8.1 adds:
 
          RSI_REVERSAL       — oversold cross (RSI<30 → RSI≥30 + green bar).
                               Classic high-WR pattern in trending universes.
@@ -221,7 +221,7 @@ BRIDGE_URL   = os.environ.get("BRIDGE_URL", "http://localhost:8765")
 BRIDGE_TOKEN = os.environ.get("JARVIS_BRIDGE_TOKEN", "")
 USE_BRIDGE   = os.environ.get("USE_BRIDGE", "1") == "1"
 
-# v1.8: bridge upgraded to streamable-HTTP MCP transport which requires
+# v1.8.1: bridge upgraded to streamable-HTTP MCP transport which requires
 # Mcp-Session-Id header on every tools/call. Get it from initialize.
 _BRIDGE_SESSION = None
 
@@ -279,7 +279,7 @@ def _bridge_session():
 def fetch_bars_via_bridge(symbol):
     """Fetch bars from Jarvis bridge instead of direct IBKR connection.
 
-    v1.8: now does the MCP session handshake (initialize → cache
+    v1.8.1: now does the MCP session handshake (initialize → cache
     Mcp-Session-Id → use it on every tools/call). The bridge upgraded
     to streamable-HTTP transport mid-session; older one-shot calls now
     return 400 "Missing session ID".
@@ -326,7 +326,7 @@ def make_bar_obj(d):
 
 # ── Technical flag engine ───────────────────────────────────────────────────
 
-# v1.8 indicator helpers
+# v1.8.1 indicator helpers
 def _rsi(closes, period=14):
     """Wilder's RSI. Returns 50 for insufficient data."""
     if len(closes) < period + 1:
@@ -374,8 +374,8 @@ _BULLISH_FLAGS = frozenset({
     "PARABOLIC_TRENDED", "HRT_REVERSAL_RISK", "GS_DISTRIB",
     "HRT_WEAK", "SQUEEZE_RESOLVING_BULL", "SQUEEZE_RESOLVING_DOWN",
     "OBV_THRUST", "VPIN_THRUST",
-    # v1.8 additions:
-    "RSI_REVERSAL", "ATR_BREAKOUT", "TREND_QUALITY",
+    # v1.8.1.1 kept:
+    "RSI_REVERSAL", "RSI_OVERBOUGHT_CONT", "ATR_BREAKOUT",
 })
 
 def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None):
@@ -593,7 +593,7 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         if "OBV_THRUST" in flags or "HRT_STRONG_v4" in flags:
             flags.append("PARABOLIC_CRISIS")
 
-    # ── v1.8 — new factors targeting win-rate lift ───────────────────────
+    # ── v1.8.1 — new factors targeting win-rate lift ───────────────────────
     # RSI, ATR computed once per call; cheap (linear over the window).
     rsi14 = _rsi(closes, 14)
     rsi_prev = _rsi(closes[:-1], 14) if len(closes) >= 16 else 50.0
@@ -601,13 +601,21 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
 
     # RSI_REVERSAL: classic oversold-bounce pattern. RSI crosses up
     # through 30 from below + today is a green bar.
-    if rsi_prev < 30 and rsi14 >= 30 and ret_1d > 0:
-        flags.append("RSI_REVERSAL")
+    # v1.8.1.1: gated on bull regime (spy_ret_60d > 0). Oversold bounces
+    # work in trending bull markets; in bear regimes they're falling
+    # knives. Bull: 69.0% WR / +5pp excess. Bear ungated: 49.5% WR /
+    # -2.16% excess. Bull-gating preserves the win.
+    if spy_ret_60d is not None and spy_ret_60d > 0:
+        if rsi_prev < 30 and rsi14 >= 30 and ret_1d > 0:
+            flags.append("RSI_REVERSAL")
 
-    # RSI_OVERBOUGHT: very high RSI on a recently-extended stock. Expected
-    # to predict mean reversion (lower forward returns) — useful as warning.
+    # RSI_OVERBOUGHT_CONT: RSI > 75 + recent run-up. Predicted to be
+    # a fade warning. Backtest showed it's actually BULLISH (+5.53%
+    # excess in bull). Momentum continues in this universe — overbought
+    # is a continuation signal, not a reversal warning. Renamed to
+    # reflect "continuation," not "warning."
     if rsi14 > 75 and ret_5d > 0.05:
-        flags.append("RSI_OVERBOUGHT")
+        flags.append("RSI_OVERBOUGHT_CONT")
 
     # ATR_BREAKOUT: 20d-high breakout that's at least 1.5 ATRs above
     # prior high. Filters out marginal breakouts that fade. Volatility-
@@ -615,27 +623,26 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if breakout_20d and atr14 > 0 and (c - high_20d) > 1.5 * atr14:
         flags.append("ATR_BREAKOUT")
 
-    # TREND_QUALITY: established-uptrend filter. Confluence overlay rather
-    # than standalone signal — designed to fire alongside other bullish
-    # flags. price > ma50 AND ma20 > ma50 = "short and medium trends aligned".
-    if c > ma50 and ma20 > ma50:
-        flags.append("TREND_QUALITY")
-
-    # PARABOLIC_TRENDED: refined PARABOLIC family. PARABOLIC_BLOCK has
-    # 52% WR (worst of system) — dead-cat bounces and failed momentum
-    # drag it down. This variant requires the parabolic move to occur
-    # within an established uptrend, which should improve WR meaningfully.
+    # PARABOLIC_TRENDED: refined PARABOLIC family. Bull: 51.4% WR
+    # (didn't lift WR over PARABOLIC_BLOCK's 52.2%, trend filter
+    # doesn't fix the fat tail). Bear: 78.0% WR / +16.84% excess —
+    # strong bear-regime signal. Kept for bear coverage even though
+    # bull WR is unchanged; the avg_ret is still excellent.
     if parabolic and c > ma50 and ma20 > ma50:
         flags.append("PARABOLIC_TRENDED")
 
-    # MULTI_CONFLUENCE_*: meta-flags counting concurrent bullish signals.
-    # By construction these should have very high WR — multiple
-    # independent confirmations of the same setup.
+    # MULTI_CONFLUENCE_3: meta-flag — 3+ concurrent bullish flags. Modest
+    # positive excess both regimes (+1.1pp bull, +2.6pp bear excess_wr).
+    # Kept as a low-noise confluence indicator. (MULTI_CONFLUENCE_5 was
+    # dropped: -3.6pp bull WR — too-crowded setups mean-revert.)
     bullish_count = sum(1 for f in flags if f in _BULLISH_FLAGS)
     if bullish_count >= 3:
         flags.append("MULTI_CONFLUENCE_3")
-    if bullish_count >= 5:
-        flags.append("MULTI_CONFLUENCE_5")
+
+    # v1.8.1.1 dropped vs v1.8.1:
+    #   TREND_QUALITY    — fired on 47% of all bars, pure noise
+    #   MULTI_CONFLUENCE_5 — -3.6pp bull WR vs baseline
+    #   RSI_OVERBOUGHT  → renamed RSI_OVERBOUGHT_CONT (semantic fix)
 
     def _edge(f):
         s = FLAG_STATS.get(f, {})
@@ -716,7 +723,7 @@ async def run(tickers=None, portfolio_mode=False):
         if not tickers:
             tickers = [p[0] for p in positions]
         else:
-            # v1.8: union — when both --portfolio and --tickers are given,
+            # v1.8.1: union — when both --portfolio and --tickers are given,
             # scan the watchlist AND add any held tickers not already in it.
             # Portfolio_data annotations still apply for held names.
             existing = set(tickers)
@@ -797,7 +804,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.8 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.8.1 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
