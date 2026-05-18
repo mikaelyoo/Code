@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.9 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.10 — Live FEMISAPIEN v3.8 Signal Scanner
+
+v1.10 adds 13F institutional ownership context to every signal:
+
+  13F snapshot     — pulls Ticker.institutional_holders + major_holders
+                     via yfinance (7d cache). Reports inst_pct, top-3
+                     holders, and Δ-shares vs prior snapshot (QoQ once
+                     the cache has accumulated history).
+  Retail-heavy gate— if inst_pct < 10 % and the technical verdict is
+                     EXECUTE, demote to BUY. Below 10 % means retail bag-
+                     holders dominate; technicals are less reliable.
 
 v1.9 fixes three gaps surfaced by the head-to-head vs femisaalpha_runner v3.8
 (2026-05-18, 9-ticker scan TSLA NVDA AMD MU GOOGL AAOI VPG HIMS HOOD):
@@ -568,6 +578,92 @@ def get_beneish_m(symbol):
     return m_score
 
 
+def get_13f_context(symbol):
+    """Snapshot of institutional ownership via yfinance. 7d cache.
+    Returns dict {inst_pct, n_top_holders, top_3, qoq_shares_change_pct} or None.
+
+    qoq_shares_change_pct compares aggregate top-10 shares vs the snapshot
+    stored when the cache entry was last invalidated (so it lights up only
+    after the second-quarter refresh of a given ticker).
+    """
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    now_ts = datetime.now().timestamp()
+    if entry.get("13f_fetched_at", 0) > now_ts - 7 * 86400:
+        return entry.get("13f")
+    yf = _yf()
+    if yf is None:
+        return None
+    result = None
+    try:
+        t = yf.Ticker(symbol)
+        ih = t.institutional_holders
+        if ih is None or (hasattr(ih, "empty") and ih.empty):
+            raise ValueError("no institutional holders")
+        top = ih.head(10) if hasattr(ih, "head") else ih
+        top_3 = []
+        total_shares_now = 0
+        for _, row in top.iterrows() if hasattr(top, "iterrows") else []:
+            shares = row.get("Shares") or row.get("shares") or 0
+            try:
+                shares = int(shares)
+            except (TypeError, ValueError):
+                shares = 0
+            total_shares_now += shares
+            if len(top_3) < 3:
+                holder = row.get("Holder") or row.get("holder") or "?"
+                pct = row.get("pctHeld") or row.get("% Out") or row.get("pct_held")
+                try:
+                    pct = round(float(pct) * 100, 2) if pct and float(pct) < 1 else (round(float(pct), 2) if pct else None)
+                except (TypeError, ValueError):
+                    pct = None
+                top_3.append({"holder": str(holder), "shares": shares, "pct_out": pct})
+
+        inst_pct = None
+        try:
+            mh = t.major_holders
+            if mh is not None and not (hasattr(mh, "empty") and mh.empty):
+                # Format varies; row labels usually include "% of Shares Held by Institutions"
+                for idx, row in (mh.iterrows() if hasattr(mh, "iterrows") else []):
+                    label = " ".join(str(v) for v in row.values).lower()
+                    if "institution" in label:
+                        for v in row.values:
+                            try:
+                                f = float(str(v).rstrip("%"))
+                                if 0 < f <= 100:
+                                    inst_pct = f
+                                    break
+                                if 0 < f <= 1:
+                                    inst_pct = round(f * 100, 2)
+                                    break
+                            except (TypeError, ValueError):
+                                continue
+                        if inst_pct is not None:
+                            break
+        except Exception:
+            pass
+
+        qoq = None
+        prior = entry.get("13f_shares_snapshot")
+        if prior and total_shares_now > 0:
+            qoq = round((total_shares_now - prior) / prior * 100, 1)
+
+        result = {
+            "inst_pct": inst_pct,
+            "n_top_holders": len(top.index) if hasattr(top, "index") else 0,
+            "top_3": top_3,
+            "total_shares_top10": total_shares_now,
+            "qoq_shares_change_pct": qoq,
+        }
+        entry["13f_shares_snapshot"] = total_shares_now
+    except Exception:
+        pass
+    entry["13f"] = result
+    entry["13f_fetched_at"] = now_ts
+    _save_fund_cache()
+    return result
+
+
 # Set of flag names known to be bullish-tilted across past calibrations.
 # Used by MULTI_CONFLUENCE_* meta-flags to count concurring bullish signals.
 _BULLISH_FLAGS = frozenset({
@@ -1031,6 +1127,16 @@ async def run(tickers=None, portfolio_mode=False):
             row["verdict"] = "🟢 BUY"
             row["gate"] = row.get("gate") or "PARABOLIC_CAP"
 
+        # v1.10 gate 4 — 13F retail-heavy: demote EXECUTE when inst_pct < 10
+        thirteen_f = get_13f_context(sym)
+        row["thirteen_f"] = thirteen_f
+        if thirteen_f and thirteen_f.get("inst_pct") is not None:
+            inst_pct = thirteen_f["inst_pct"]
+            if inst_pct < 10 and row["ev_score"] >= 4:
+                row["ev_score"] = min(row["ev_score"], 3.5)
+                row["verdict"] = "🟢 BUY"
+                row["gate"] = row.get("gate") or f"RETAIL_HEAVY_INST={inst_pct}%"
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -1048,7 +1154,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.9 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.10 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -1088,10 +1194,19 @@ def print_report(results):
                 fund_bits.append(f"earnings={r['earnings_dte']}d")
             if r.get("beneish_m") is not None:
                 fund_bits.append(f"M={r['beneish_m']}")
+            tf = r.get("thirteen_f")
+            if tf:
+                if tf.get("inst_pct") is not None:
+                    fund_bits.append(f"inst={tf['inst_pct']}%")
+                if tf.get("qoq_shares_change_pct") is not None:
+                    fund_bits.append(f"13F_qoq={tf['qoq_shares_change_pct']:+.1f}%")
             if r.get("gate"):
                 fund_bits.append(f"gate={r['gate']}")
             if fund_bits:
                 print(f"           {' | '.join(fund_bits)}")
+            if tf and tf.get("top_3"):
+                holders = ", ".join(h["holder"][:18] for h in tf["top_3"])
+                print(f"           top3: {holders}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
