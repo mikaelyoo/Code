@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.10.1 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.10.2 — Live FEMISAPIEN v3.8 Signal Scanner
+
+v1.10.2 — fix inst_pct parser for new yfinance format. v1.10.1 left every
+inst_pct == None because yfinance 0.2.55+ moved the field labels into the
+DataFrame index (institutionsPercentHeld) and my parser only inspected
+row.values. v1.10.2 reads the index, falls back to the old 2-column shape,
+then falls back to Ticker.info["heldPercentInstitutions"]. Cache entries
+with inst_pct=None are auto-invalidated early so the upgraded parser takes
+effect without waiting for the 7-day TTL.
 
 v1.10.1 hot-fix: yfinance endpoints can hang indefinitely (no built-in
 timeout). v1.10 froze on the first 13F call. v1.10.1 wraps every yfinance
@@ -613,8 +621,13 @@ def get_13f_context(symbol):
     cache = _load_fund_cache()
     entry = cache.setdefault(symbol, {})
     now_ts = datetime.now().timestamp()
-    if entry.get("13f_fetched_at", 0) > now_ts - 7 * 86400:
-        return entry.get("13f")
+    cached = entry.get("13f")
+    # v1.10.2: invalidate the cache early if the prior fetch failed to
+    # populate inst_pct — gives the upgraded parser a chance to succeed
+    # without waiting for the 7-day TTL to elapse.
+    cached_has_inst = isinstance(cached, dict) and cached.get("inst_pct") is not None
+    if entry.get("13f_fetched_at", 0) > now_ts - 7 * 86400 and cached_has_inst:
+        return cached
     yf = _yf()
     if yf is None:
         return None
@@ -647,23 +660,46 @@ def get_13f_context(symbol):
         try:
             mh = _yf_call(lambda: t.major_holders)
             if mh is not None and not (hasattr(mh, "empty") and mh.empty):
-                # Format varies; row labels usually include "% of Shares Held by Institutions"
-                for idx, row in (mh.iterrows() if hasattr(mh, "iterrows") else []):
-                    label = " ".join(str(v) for v in row.values).lower()
-                    if "institution" in label:
+                # New yfinance format (0.2.55+): single-column DataFrame
+                # indexed by camelCase field names (institutionsPercentHeld etc).
+                try:
+                    if hasattr(mh, "index") and "institutionsPercentHeld" in mh.index:
+                        v = float(mh.loc["institutionsPercentHeld"].iloc[0])
+                        inst_pct = round(v * 100, 2) if 0 < v <= 1 else round(v, 2)
+                except Exception:
+                    pass
+                # Old format fallback: 2-column DataFrame with text labels.
+                if inst_pct is None:
+                    for idx, row in mh.iterrows():
+                        # The label may live in the index OR in row.values.
+                        label_parts = [str(idx)] + [str(v) for v in row.values]
+                        label = " ".join(label_parts).lower()
+                        if "institution" not in label:
+                            continue
                         for v in row.values:
                             try:
-                                f = float(str(v).rstrip("%"))
-                                if 0 < f <= 100:
-                                    inst_pct = f
-                                    break
-                                if 0 < f <= 1:
-                                    inst_pct = round(f * 100, 2)
-                                    break
+                                f = float(str(v).rstrip("%").replace(",", ""))
                             except (TypeError, ValueError):
                                 continue
+                            if 0 < f <= 1:
+                                inst_pct = round(f * 100, 2)
+                                break
+                            if 1 < f <= 100:
+                                inst_pct = round(f, 2)
+                                break
                         if inst_pct is not None:
                             break
+            # Last-resort fallback: Ticker.info has heldPercentInstitutions.
+            if inst_pct is None:
+                info = _yf_call(lambda: t.info)
+                if isinstance(info, dict):
+                    v = info.get("heldPercentInstitutions")
+                    if v is not None:
+                        try:
+                            f = float(v)
+                            inst_pct = round(f * 100, 2) if 0 < f <= 1 else round(f, 2)
+                        except (TypeError, ValueError):
+                            pass
         except Exception:
             pass
 
@@ -1178,7 +1214,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.10.1 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.10.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
