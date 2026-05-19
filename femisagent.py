@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.10 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v1.10.1 — Live FEMISAPIEN v3.8 Signal Scanner
+
+v1.10.1 hot-fix: yfinance endpoints can hang indefinitely (no built-in
+timeout). v1.10 froze on the first 13F call. v1.10.1 wraps every yfinance
+attribute access in a ThreadPoolExecutor with a 5-second wall-clock cap;
+on timeout the gate degrades gracefully (returns None, signal proceeds).
 
 v1.10 adds 13F institutional ownership context to every signal:
 
@@ -447,6 +452,23 @@ def _atr(highs, lows, closes, period=14):
 _FUND_CACHE_PATH = "/data/.openclaw/workspace/memory/femisagent_fundamentals.cache.json"
 _FUND_CACHE = None
 
+# v1.10.1: yfinance has no per-request timeout. Wrap attribute access in a
+# thread with a hard wall-clock cap so a single hung HTTP call can't freeze
+# the entire scan. 5s/call × 5 calls/ticker × 69 tickers worst case ~= 29min,
+# but in practice the cache absorbs most of that after the first run.
+import concurrent.futures as _cf
+_YF_EXECUTOR = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="yf")
+_YF_TIMEOUT_SEC = 5
+
+def _yf_call(fn):
+    """Run `fn` (a zero-arg callable) with a hard timeout. Returns None on
+    timeout, exception, or rate-limit. Safe to chain attribute accesses by
+    wrapping each in a lambda: _yf_call(lambda: yf.Ticker(s).calendar)."""
+    try:
+        return _YF_EXECUTOR.submit(fn).result(timeout=_YF_TIMEOUT_SEC)
+    except (_cf.TimeoutError, Exception):
+        return None
+
 def _load_fund_cache():
     global _FUND_CACHE
     if _FUND_CACHE is not None:
@@ -488,7 +510,7 @@ def get_earnings_dte(symbol):
         return None
     dte = None
     try:
-        cal = yf.Ticker(symbol).calendar
+        cal = _yf_call(lambda: yf.Ticker(symbol).calendar)
         ed = None
         if isinstance(cal, dict):
             v = cal.get("Earnings Date")
@@ -525,7 +547,9 @@ def get_beneish_m(symbol):
     m_score = None
     try:
         t = yf.Ticker(symbol)
-        bs, is_, cf = t.balance_sheet, t.income_stmt, t.cashflow
+        bs = _yf_call(lambda: t.balance_sheet)
+        is_ = _yf_call(lambda: t.income_stmt)
+        cf = _yf_call(lambda: t.cashflow)
         if bs is None or is_ is None or cf is None:
             raise ValueError("missing statements")
         if bs.shape[1] < 2 or is_.shape[1] < 2 or cf.shape[1] < 2:
@@ -597,7 +621,7 @@ def get_13f_context(symbol):
     result = None
     try:
         t = yf.Ticker(symbol)
-        ih = t.institutional_holders
+        ih = _yf_call(lambda: t.institutional_holders)
         if ih is None or (hasattr(ih, "empty") and ih.empty):
             raise ValueError("no institutional holders")
         top = ih.head(10) if hasattr(ih, "head") else ih
@@ -621,7 +645,7 @@ def get_13f_context(symbol):
 
         inst_pct = None
         try:
-            mh = t.major_holders
+            mh = _yf_call(lambda: t.major_holders)
             if mh is not None and not (hasattr(mh, "empty") and mh.empty):
                 # Format varies; row labels usually include "% of Shares Held by Institutions"
                 for idx, row in (mh.iterrows() if hasattr(mh, "iterrows") else []):
@@ -1154,7 +1178,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.10 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v1.10.1 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
