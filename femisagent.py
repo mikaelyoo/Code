@@ -1255,6 +1255,23 @@ _PRICE_DECOMP_PATH_CANDIDATES = [
     "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/valuation_zscore.py",
 ]
 
+# v2.7 — three new backends: insider_radar, earnings_revision_tracker, options_flow
+_INSIDER_PATH_CANDIDATES = [
+    os.environ.get("INSIDER_RADAR_PATH"),
+    "/data/.openclaw/workspace/scripts/insider_radar.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/insider_radar.py",
+]
+_EPS_REV_PATH_CANDIDATES = [
+    os.environ.get("EPS_REV_PATH"),
+    "/data/.openclaw/workspace/scripts/earnings_revision_tracker.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/earnings_revision_tracker.py",
+]
+_OPTIONS_FLOW_PATH_CANDIDATES = [
+    os.environ.get("OPTIONS_FLOW_PATH"),
+    "/data/.openclaw/workspace/scripts/options_flow.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/options_flow.py",
+]
+
 def _first_existing(paths):
     for p in paths:
         if p and os.path.exists(p):
@@ -1510,6 +1527,111 @@ def get_price_decomp_signals(symbol):
     except Exception:
         pass
     return None
+
+
+def _run_simple_backend(symbol, candidates, ttl_sec, cache_key,
+                        try_args=None, parse_keys=None):
+    """v2.7 — generic backend runner for insider/EPS/options scripts.
+    Tries multiple CLI arg shapes (--ticker, positional, --json). Returns
+    a dict with whichever fields the parser regex matched, or None.
+
+    try_args: list of [arg_template_lists] to attempt in order
+    parse_keys: list of (key_name, regex_pattern) tuples
+    """
+    cached, refetch = _backend_cache_get(symbol, cache_key, ttl_sec)
+    if not refetch:
+        return cached
+    path = _first_existing(candidates)
+    if not path:
+        return None
+    try:
+        import subprocess, re as _re
+        cwd = os.path.dirname(path)
+        out = ""
+        for args in (try_args or [["--ticker", symbol, "--json"],
+                                   [symbol, "--json"],
+                                   ["--ticker", symbol],
+                                   [symbol]]):
+            r = subprocess.run([sys.executable, path] + args,
+                               capture_output=True, text=True,
+                               timeout=45, cwd=cwd)
+            t = (r.stdout or "")
+            if t.strip() and "usage:" not in t.lower()[:200] and \
+               "error: unrecognized" not in t.lower():
+                out = t[:6000]
+                break
+        if not out:
+            return None
+        signals = {}
+        # JSON object first
+        jm = _re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", out, _re.DOTALL)
+        if jm:
+            try:
+                obj = json.loads(jm.group())
+                for k, v in obj.items():
+                    if isinstance(v, (int, float, str, bool, list, dict)):
+                        signals[k] = v
+            except Exception:
+                pass
+        # Text regex fallback
+        if parse_keys:
+            for key, pat in parse_keys:
+                m = _re.search(pat, out, _re.IGNORECASE)
+                if m and key not in signals:
+                    try:
+                        v = m.group(1)
+                        try:
+                            signals[key] = float(v)
+                        except (ValueError, TypeError):
+                            signals[key] = v.strip()
+                    except IndexError:
+                        signals[key] = True
+        if signals:
+            _backend_cache_set(symbol, cache_key, signals)
+            return signals
+    except Exception:
+        pass
+    return None
+
+def get_insider_signals(symbol):
+    """insider_radar.py — SEC Form 4 insider buy/sell tracking. 24h cache."""
+    return _run_simple_backend(
+        symbol, _INSIDER_PATH_CANDIDATES, ttl_sec=86400, cache_key="insider",
+        parse_keys=[
+            ("buy_count", r"(?:insider[_ ]?buy|buy)[_ ]?count[:\s]+(\d+)"),
+            ("sell_count", r"(?:insider[_ ]?sell|sell)[_ ]?count[:\s]+(\d+)"),
+            ("net_buys", r"net[_ ]?buy[s]?[:\s]+([+-]?\d+)"),
+            ("buy_value_usd", r"buy[_ ]?(?:value|usd)[:\s$]+([\d.,]+)"),
+            ("sell_value_usd", r"sell[_ ]?(?:value|usd)[:\s$]+([\d.,]+)"),
+            ("verdict", r"(?:insider[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+        ])
+
+def get_eps_revision_signals(symbol):
+    """earnings_revision_tracker.py — analyst EPS estimate revisions. 12h cache."""
+    return _run_simple_backend(
+        symbol, _EPS_REV_PATH_CANDIDATES, ttl_sec=12 * 3600, cache_key="eps_rev",
+        parse_keys=[
+            ("revision_direction", r"(?:revision[_ ]?direction|trend)[:\s]+(UP|DOWN|FLAT|MIXED)"),
+            ("revision_magnitude", r"(?:revision[_ ]?magnitude|change)[:\s]+([+-]?[\d.]+)%?"),
+            ("up_count", r"up[_ ]?(?:count|revisions)[:\s]+(\d+)"),
+            ("down_count", r"down[_ ]?(?:count|revisions)[:\s]+(\d+)"),
+            ("revision_score", r"(?:revision|momentum)[_ ]?score[:\s]+([+-]?\d+)"),
+            ("eps_surprise_last", r"(?:eps[_ ]?surprise|last[_ ]?surprise)[:\s]+([+-]?[\d.]+)%?"),
+        ])
+
+def get_options_flow_signals(symbol):
+    """options_flow.py — unusual options flow / put-call analysis. 6h cache."""
+    return _run_simple_backend(
+        symbol, _OPTIONS_FLOW_PATH_CANDIDATES, ttl_sec=6 * 3600, cache_key="opts_flow",
+        parse_keys=[
+            ("put_call_ratio", r"(?:put[_ ]?call|p/c)[_ ]?ratio[:\s]+([\d.]+)"),
+            ("unusual_volume", r"unusual[_ ]?(?:volume|activity)[:\s]+(YES|NO|TRUE|FALSE)"),
+            ("flow_direction", r"flow[_ ]?(?:direction|tilt)[:\s]+(BULLISH|BEARISH|NEUTRAL)"),
+            ("call_volume", r"call[_ ]?volume[:\s]+([\d.,]+)"),
+            ("put_volume", r"put[_ ]?volume[:\s]+([\d.,]+)"),
+            ("iv_rank", r"iv[_ ]?rank[:\s]+([\d.]+)"),
+            ("verdict", r"(?:options[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+        ])
 
 
 # Set of flag names known to be bullish-tilted across past calibrations.
@@ -2160,6 +2282,56 @@ async def run(tickers=None, portfolio_mode=False):
                 elif gap > 20:
                     row["all_flags"].append(f"PD_UPSIDE_{gap:+.0f}")
 
+        # v2.7 — insider radar (Form 4 buy/sell clustering)
+        ins = get_insider_signals(sym)
+        row["insider"] = ins
+        if ins:
+            buys = int(ins.get("buy_count", 0) or 0)
+            sells = int(ins.get("sell_count", 0) or 0)
+            if buys >= 3 and buys > sells:
+                row["all_flags"].append(f"INSIDER_BUY_CLUSTER_{buys}")
+            elif sells >= 3 and sells > buys * 2:
+                row["all_flags"].append(f"INSIDER_SELL_HEAVY_{sells}")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or f"INSIDER_SELL_{sells}"
+
+        # v2.7 — EPS revisions (analyst estimate momentum)
+        eps = get_eps_revision_signals(sym)
+        row["eps_rev"] = eps
+        if eps:
+            direction = (eps.get("revision_direction") or "").upper()
+            score = eps.get("revision_score")
+            if direction == "DOWN" or (score is not None and float(score) <= -2):
+                row["all_flags"].append("EPS_REV_DOWN")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "EPS_REV_DOWN"
+            elif direction == "UP" and score is not None and float(score) >= 2:
+                row["all_flags"].append(f"EPS_REV_UP_STRONG_{score}")
+
+        # v2.7 — options flow (put/call + unusual volume)
+        opts = get_options_flow_signals(sym)
+        row["opts_flow"] = opts
+        if opts:
+            pcr = opts.get("put_call_ratio")
+            flow = (opts.get("flow_direction") or "").upper()
+            if pcr is not None:
+                try:
+                    pcr = float(pcr)
+                    if pcr > 2.0 or flow == "BEARISH":
+                        row["all_flags"].append(f"OPTIONS_PUT_HEAVY_{pcr:.2f}")
+                        if row["ev_score"] >= 4:
+                            row["ev_score"] = min(row["ev_score"], 3.5)
+                            row["verdict"] = "🟢 BUY"
+                            row["gate"] = row.get("gate") or f"OPTIONS_PUT_HEAVY={pcr:.2f}"
+                    elif pcr < 0.4 or flow == "BULLISH":
+                        row["all_flags"].append(f"OPTIONS_CALL_HEAVY_{pcr:.2f}")
+                except (ValueError, TypeError):
+                    pass
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -2184,7 +2356,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.6.1 (6-engine + Ceyhun_OBOB + TTR + Libertus_RSI_Div_pivot) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.7 (11-engine + insider/EPS_rev/options_flow) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -2306,6 +2478,44 @@ def print_report(results):
                             pdb.append(f"{k}={v}")
                 if len(pdb) > 1:
                     print(f"           PRICE_DECOMP: {' | '.join(pdb)}")
+            # v2.7 displays
+            ins = r.get("insider")
+            if ins:
+                ib = []
+                if ins.get("buy_count") is not None:
+                    ib.append(f"buys={ins['buy_count']}")
+                if ins.get("sell_count") is not None:
+                    ib.append(f"sells={ins['sell_count']}")
+                if ins.get("net_buys") is not None:
+                    ib.append(f"net={ins['net_buys']:+}")
+                if ins.get("verdict"):
+                    ib.append(f"v={ins['verdict']}")
+                if ib:
+                    print(f"           INSIDER: {' | '.join(ib)}")
+            eps = r.get("eps_rev")
+            if eps:
+                eb = []
+                if eps.get("revision_direction"):
+                    eb.append(f"dir={eps['revision_direction']}")
+                if eps.get("revision_score") is not None:
+                    eb.append(f"score={eps['revision_score']}")
+                if eps.get("up_count") is not None and eps.get("down_count") is not None:
+                    eb.append(f"up/dn={eps['up_count']}/{eps['down_count']}")
+                if eb:
+                    print(f"           EPS_REV: {' | '.join(eb)}")
+            opts = r.get("opts_flow")
+            if opts:
+                ob = []
+                if opts.get("put_call_ratio") is not None:
+                    try: ob.append(f"P/C={float(opts['put_call_ratio']):.2f}")
+                    except (ValueError, TypeError): pass
+                if opts.get("flow_direction"):
+                    ob.append(f"flow={opts['flow_direction']}")
+                if opts.get("iv_rank") is not None:
+                    try: ob.append(f"IV_rank={float(opts['iv_rank']):.0f}")
+                    except (ValueError, TypeError): pass
+                if ob:
+                    print(f"           OPTIONS: {' | '.join(ob)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
