@@ -575,6 +575,82 @@ def _atr(highs, lows, closes, period=14):
         atr = (atr * (period - 1) + tr) / period
     return atr
 
+# v2.4 — EMA series + rolling stdev (needed for the Ceyhun OBOB Pine port)
+def _ema_series(values, period):
+    """EMA of a series; first period-1 entries None, seeds with SMA. Matches Pine."""
+    n = len(values)
+    if n < period:
+        return [None] * n
+    out = [None] * (period - 1)
+    sma = sum(values[:period]) / period
+    out.append(sma)
+    alpha = 2.0 / (period + 1)
+    prev = sma
+    for v in values[period:]:
+        prev = prev + alpha * (v - prev)
+        out.append(prev)
+    return out
+
+def _stdev_rolling(values, period):
+    """Rolling stdev over trailing `period`; first period-1 entries None."""
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(None)
+            continue
+        window = values[i - period + 1 : i + 1]
+        mean = sum(window) / period
+        var = sum((x - mean) ** 2 for x in window) / period
+        out.append(var ** 0.5 if var > 0 else 0.0)
+    return out
+
+def ceyhun_obob_signal(bars, n=5):
+    """Ceyhun Overbought/Oversold (Pine v4) — triple-EMA-smoothed z-score with
+    crossover trigger. Source: ceyhun, Mozilla Public License 2.0.
+
+      ys1 = (high + low + close*2) / 4
+      rk5 = (ys1 - ema(ys1, n)) * 100 / stdev(ys1, n)
+      up  = ema(ema(rk5, n), n)
+      down = ema(up, n)
+      Buy  = up crossover  down
+      Sell = up crossunder down
+
+    Returns 'BUY' / 'SELL' / None for the most recent bar.
+    """
+    if len(bars) < n * 4 + 2:
+        return None
+    ys1 = [(b.high + b.low + b.close * 2) / 4.0 for b in bars]
+    rk3 = _ema_series(ys1, n)
+    rk4 = _stdev_rolling(ys1, n)
+    rk5 = []
+    for v, e, s in zip(ys1, rk3, rk4):
+        if e is None or s is None or s == 0:
+            rk5.append(None)
+        else:
+            rk5.append((v - e) * 100.0 / s)
+    rk5_clean = [v for v in rk5 if v is not None]
+    if len(rk5_clean) < n * 3 + 2:
+        return None
+    rk6 = _ema_series(rk5_clean, n)
+    rk6_clean = [v for v in rk6 if v is not None]
+    if len(rk6_clean) < n * 2 + 2:
+        return None
+    up = _ema_series(rk6_clean, n)
+    up_clean = [v for v in up if v is not None]
+    if len(up_clean) < n + 2:
+        return None
+    down = _ema_series(up_clean, n)
+    aligned = [(u, d) for u, d in zip(up_clean, down) if u is not None and d is not None]
+    if len(aligned) < 2:
+        return None
+    u_prev, d_prev = aligned[-2]
+    u_curr, d_curr = aligned[-1]
+    if u_prev <= d_prev and u_curr > d_curr:
+        return "BUY"
+    if u_prev >= d_prev and u_curr < d_curr:
+        return "SELL"
+    return None
+
 # ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
 
 _FUND_CACHE_PATH = "/data/.openclaw/workspace/memory/femisagent_fundamentals.cache.json"
@@ -1507,6 +1583,17 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     if bullish_count >= 3:
         flags.append("MULTI_CONFLUENCE_3")
 
+    # v2.4 — Ceyhun Overbought/Oversold (Pine v4 port). Triple-EMA-smoothed
+    # z-score; fires BUY on up-crossover, SELL on up-crossunder. n=5 per the
+    # original. No FLAG_STATS entry yet → EV=0 (informational only); the next
+    # backtest cycle calibrates and the Wilson-CI demote rule promotes/demotes
+    # based on real edge.
+    obob = ceyhun_obob_signal(bars, n=5)
+    if obob == "BUY":
+        flags.append("CEYHUN_OBOB_BUY")
+    elif obob == "SELL":
+        flags.append("CEYHUN_OBOB_SELL")
+
     # v1.8.2.1 dropped vs v1.8.2:
     #   TREND_QUALITY    — fired on 47% of all bars, pure noise
     #   MULTI_CONFLUENCE_5 — -3.6pp bull WR vs baseline
@@ -1841,7 +1928,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.3.3 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.4 (femisapien + TA Fusion + sentiment + price-decomp + Ceyhun_OBOB) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
