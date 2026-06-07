@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v2.3 — Unified multi-engine Signal Engine
+FEMISAGENT v2.3.1 — Unified multi-engine Signal Engine
+
+v2.3.1 — fix CLI conventions per backend script:
+  - football_field / epv_sotp / hg_dcf use POSITIONAL ticker + --json
+  - news_radar / analyst_intelligence: try --ticker first, fall back to positional
+  - JSON-mode preferred when supported (cleaner parsing than text scrape)
 
 v2.3 — adds TA Fusion + sentiment as cross-engine backends. Three new
 quant overlays alongside femisapien:
@@ -1039,15 +1044,20 @@ def get_sentiment_signals(symbol):
     out = {"news_score": None, "analyst_score": None, "combined_score": None,
            "news_raw": None, "analyst_raw": None}
 
-    # news_radar
+    # news_radar — try --ticker first, then positional fallback
     news_path = _first_existing(_NEWS_RADAR_PATH_CANDIDATES)
     if news_path:
         try:
             import subprocess, re as _re
+            cwd = os.path.dirname(news_path)
             r = subprocess.run([sys.executable, news_path, "--ticker", symbol],
-                               capture_output=True, text=True, timeout=30,
-                               cwd=os.path.dirname(news_path))
+                               capture_output=True, text=True, timeout=30, cwd=cwd)
             t = (r.stdout or "")[:2000]
+            if not t.strip() or "usage:" in t.lower() or "error:" in t.lower():
+                # Try positional
+                r = subprocess.run([sys.executable, news_path, symbol],
+                                   capture_output=True, text=True, timeout=30, cwd=cwd)
+                t = (r.stdout or "")[:2000]
             out["news_raw"] = t[:300]
             for pat in [r"sentiment[_ ]score[:\s]+([+-]?[\d.]+)",
                         r"composite[:\s]+([+-]?[\d.]+)"]:
@@ -1066,15 +1076,19 @@ def get_sentiment_signals(symbol):
         except Exception:
             pass
 
-    # analyst_intelligence
+    # analyst_intelligence — try --ticker first, then positional fallback
     ai_path = _first_existing(_ANALYST_INT_PATH_CANDIDATES)
     if ai_path:
         try:
             import subprocess, re as _re
+            cwd = os.path.dirname(ai_path)
             r = subprocess.run([sys.executable, ai_path, "--ticker", symbol],
-                               capture_output=True, text=True, timeout=30,
-                               cwd=os.path.dirname(ai_path))
+                               capture_output=True, text=True, timeout=30, cwd=cwd)
             t = (r.stdout or "")[:2000]
+            if not t.strip() or "usage:" in t.lower() or "error:" in t.lower():
+                r = subprocess.run([sys.executable, ai_path, symbol],
+                                   capture_output=True, text=True, timeout=30, cwd=cwd)
+                t = (r.stdout or "")[:2000]
             out["analyst_raw"] = t[:300]
             for pat in [r"analyst[_ ]score[:\s]+([+-]?[\d.]+)",
                         r"consensus[_ ]score[:\s]+([+-]?[\d.]+)"]:
@@ -1107,9 +1121,8 @@ def get_sentiment_signals(symbol):
     return None
 
 def get_price_decomp_signals(symbol):
-    """Bottoms-up price decomposition. Returns dict with fair_value, gap_pct, components or None.
-    Looks for epv_sotp.py / football_field.py / valuation_zscore.py — first one wins.
-    Cached 24h since fundamentals refresh slowly."""
+    """Bottoms-up price decomposition. football_field.py / epv_sotp.py / hg_dcf.py
+    all use POSITIONAL ticker + --json. Tries each in order. 24h cache."""
     cached, refetch = _backend_cache_get(symbol, "price_decomp", 24 * 3600)
     if not refetch:
         return cached
@@ -1118,32 +1131,58 @@ def get_price_decomp_signals(symbol):
         return None
     try:
         import subprocess, re as _re
-        r = subprocess.run([sys.executable, path, "--ticker", symbol],
-                           capture_output=True, text=True, timeout=60,
+        # Positional ticker + --json (works for football_field, epv_sotp, hg_dcf)
+        r = subprocess.run([sys.executable, path, symbol, "--json"],
+                           capture_output=True, text=True, timeout=90,
                            cwd=os.path.dirname(path))
-        t = (r.stdout or "")[:3000]
+        t = (r.stdout or "")[:6000]
         if not t:
             return None
-        signals = {"backend": os.path.basename(path), "raw": t[:400]}
-        for key, pat in [
-            ("fair_value", r"(?:fair[_ ]value|intrinsic[_ ]value|target)[:\s$]+([\d.,]+)"),
-            ("current_price", r"(?:current[_ ]price|spot)[:\s$]+([\d.,]+)"),
-            ("gap_pct", r"(?:gap|upside|discount)[:\s]+([-+]?[\d.]+)%"),
-            ("zscore", r"(?:z[_-]score|zscore)[:\s]+([-+]?[\d.]+)"),
-            ("verdict", r"(?:verdict|recommendation|signal)[:\s]+([A-Z_]+)"),
-        ]:
-            m = _re.search(pat, t, _re.IGNORECASE)
-            if m:
-                try:
-                    if key in ("fair_value", "current_price"):
-                        signals[key] = float(m.group(1).replace(",", ""))
-                    elif key in ("gap_pct", "zscore"):
-                        signals[key] = float(m.group(1))
-                    else:
-                        signals[key] = m.group(1)
-                except ValueError:
-                    pass
-        if any(k in signals for k in ("fair_value", "gap_pct", "zscore", "verdict")):
+        signals = {"backend": os.path.basename(path)}
+        # Try JSON parse first
+        json_obj = None
+        m = _re.search(r"\{.*\}", t, _re.DOTALL)
+        if m:
+            try:
+                json_obj = json.loads(m.group())
+            except Exception:
+                pass
+        if json_obj:
+            # football_field exposes: median_fair_value, current_price, upside_pct,
+            # methods (8 valuation methods), verdict
+            for k in ("median_fair_value", "fair_value", "intrinsic_value",
+                     "current_price", "upside_pct", "gap_pct", "discount_pct",
+                     "verdict", "recommendation", "implied_growth", "epv",
+                     "sotp_value", "hg_dcf_value", "graham_number", "moat_rating"):
+                if k in json_obj:
+                    signals[k] = json_obj[k]
+            # Normalize gap_pct from upside_pct/discount_pct
+            if "gap_pct" not in signals:
+                if "upside_pct" in signals:
+                    signals["gap_pct"] = signals["upside_pct"]
+                elif "discount_pct" in signals:
+                    signals["gap_pct"] = -abs(signals["discount_pct"])
+        else:
+            # Text-mode fallback
+            for key, pat in [
+                ("fair_value", r"(?:median[_ ]fair[_ ]value|fair[_ ]value|intrinsic[_ ]value)[:\s$]+([\d.,]+)"),
+                ("current_price", r"(?:current[_ ]price|spot)[:\s$]+([\d.,]+)"),
+                ("gap_pct", r"(?:upside|gap|discount)[:\s]+([-+]?[\d.]+)%"),
+                ("zscore", r"(?:z[_-]score|zscore)[:\s]+([-+]?[\d.]+)"),
+                ("verdict", r"(?:verdict|recommendation|signal)[:\s]+([A-Z_]+)"),
+            ]:
+                m = _re.search(pat, t, _re.IGNORECASE)
+                if m:
+                    try:
+                        if key in ("fair_value", "current_price"):
+                            signals[key] = float(m.group(1).replace(",", ""))
+                        elif key in ("gap_pct", "zscore"):
+                            signals[key] = float(m.group(1))
+                        else:
+                            signals[key] = m.group(1)
+                    except ValueError:
+                        pass
+        if any(k in signals for k in ("fair_value", "median_fair_value", "gap_pct", "zscore", "verdict")):
             _backend_cache_set(symbol, "price_decomp", signals)
             return signals
     except Exception:
@@ -1753,7 +1792,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.3 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.3.1 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
