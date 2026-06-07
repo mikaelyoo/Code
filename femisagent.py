@@ -789,50 +789,70 @@ def ttr_near_flip(bars, threshold_pct=1.0, start=0.02, increment=0.02, max_af=0.
         return "BEARISH_NEAR"   # price above PSAR, about to break below
     return None
 
-def libertus_rsi_div_signal(bars, length=14, xbars=90, recent_window=5):
+def libertus_rsi_div_signal(bars, length=14, xbars=90, pivot_window=3, recency_bars=10):
     """Libertus RSI Divergence (Pine v4 port, Libertus 2021) — detects
     bullish/bearish divergence between 14-period RSI and price.
 
-    Bearish: price made HIGHER HIGH in recent window vs prior window,
-             but RSI made LOWER HIGH (momentum weakening despite price rise)
-    Bullish: price made LOWER LOW, but RSI made HIGHER LOW (selling
-             pressure waning despite price drop)
+    v2.6.1: pivot-based detection (matches Pine's `highestbars` semantics
+    more closely than the original window-MAX comparison).
 
-    Returns 'BULL_DIV', 'BEAR_DIV', or None for the most recent bar.
+    Algorithm:
+      1. Find swing-high pivots in the last `xbars` bars (a swing high
+         is a close higher than the `pivot_window` bars on each side).
+      2. Compare the two most recent swing highs:
+           if newer pivot price > older pivot price AND
+              newer pivot RSI < older pivot RSI AND
+              newer pivot is within `recency_bars` of current bar
+           → BEAR_DIV
+      3. Same logic for swing lows → BULL_DIV.
 
-    The original Pine maintained per-bar running max/min state with
-    `highestbars(rsi, xbars)`; this port uses a simpler window-comparison
-    approach that captures the same decision logic without bar-by-bar
-    state simulation. xbars=90 lookback, recent_window=5 bars for the
-    "now" comparison vs the prior 85-bar window.
+    pivot_window=3 means a confirmed swing pivot needs 3 lower bars on
+    each side. Most recent visible pivot is at least 3 bars old.
+    recency_bars=10 limits the signal to "fresh" divergences only.
+
+    Returns 'BULL_DIV', 'BEAR_DIV', or None.
     """
-    if len(bars) < length + xbars:
+    if len(bars) < length + 20:
         return None
+    n = len(bars)
     closes = [b.close for b in bars]
     rsi_s = _rsi_series(closes, length)
-    n = len(bars)
-    # Recent window (last `recent_window` bars) vs prior window (everything
-    # before that, capped at xbars total lookback).
-    start = max(0, n - xbars)
-    prior_end = n - recent_window
-    if prior_end - start < recent_window:
-        return None
-    recent_closes = closes[prior_end:n]
-    prior_closes = closes[start:prior_end]
-    recent_rsi = [r for r in rsi_s[prior_end:n] if r is not None]
-    prior_rsi = [r for r in rsi_s[start:prior_end] if r is not None]
-    if not recent_rsi or not prior_rsi:
-        return None
-    rch, pch = max(recent_closes), max(prior_closes)
-    rcl, pcl = min(recent_closes), min(prior_closes)
-    rrh, prh = max(recent_rsi), max(prior_rsi)
-    rrl, prl = min(recent_rsi), min(prior_rsi)
-    # Bearish divergence
-    if rch > pch and rrh < prh:
-        return "BEAR_DIV"
-    # Bullish divergence
-    if rcl < pcl and rrl > prl:
-        return "BULL_DIV"
+
+    # Build pivot lists in the lookback window
+    start = max(length, n - xbars) + pivot_window
+    end = n - pivot_window
+    pivot_highs = []  # list of (idx, close, rsi)
+    pivot_lows = []
+    for i in range(start, end):
+        if rsi_s[i] is None:
+            continue
+        left = closes[i - pivot_window : i]
+        right = closes[i + 1 : i + 1 + pivot_window]
+        if not left or not right:
+            continue
+        cmax_neighbors = max(left + right)
+        cmin_neighbors = min(left + right)
+        if closes[i] > cmax_neighbors:
+            pivot_highs.append((i, closes[i], rsi_s[i]))
+        if closes[i] < cmin_neighbors:
+            pivot_lows.append((i, closes[i], rsi_s[i]))
+
+    # Bearish divergence: most recent swing high has higher price but lower RSI
+    if len(pivot_highs) >= 2:
+        prev_i, prev_c, prev_r = pivot_highs[-2]
+        curr_i, curr_c, curr_r = pivot_highs[-1]
+        if (curr_c > prev_c and curr_r < prev_r
+                and curr_i - prev_i >= 5
+                and n - curr_i <= recency_bars):
+            return "BEAR_DIV"
+    # Bullish divergence: most recent swing low has lower price but higher RSI
+    if len(pivot_lows) >= 2:
+        prev_i, prev_c, prev_r = pivot_lows[-2]
+        curr_i, curr_c, curr_r = pivot_lows[-1]
+        if (curr_c < prev_c and curr_r > prev_r
+                and curr_i - prev_i >= 5
+                and n - curr_i <= recency_bars):
+            return "BULL_DIV"
     return None
 
 # ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
@@ -2164,7 +2184,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.6 (6-engine + Ceyhun_OBOB + TTR + Libertus_RSI_Div) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.6.1 (6-engine + Ceyhun_OBOB + TTR + Libertus_RSI_Div_pivot) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
