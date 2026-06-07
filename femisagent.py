@@ -506,8 +506,17 @@ def get_positions_via_bridge():
                         sym = pos.get("symbol", "")
                         exch = pos.get("exchange", "SMART")
                         cur = pos.get("currency", "USD")
-                        qty = pos.get("qty") or pos.get("position") or 0
-                        cost = pos.get("avgCost") or pos.get("avg_cost") or 0
+                        # v2.3.3: bridge MCP sometimes returns numeric fields as
+                        # JSON strings — coerce defensively to avoid str/float
+                        # arithmetic errors downstream in the run loop.
+                        try:
+                            qty = float(pos.get("qty") or pos.get("position") or 0)
+                        except (TypeError, ValueError):
+                            qty = 0.0
+                        try:
+                            cost = float(pos.get("avgCost") or pos.get("avg_cost") or 0)
+                        except (TypeError, ValueError):
+                            cost = 0.0
                         if sym:
                             out.append((sym, exch, cur, qty, cost))
                     return out
@@ -1811,8 +1820,15 @@ async def run(tickers=None, portfolio_mode=False):
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
-            row["avg_cost"] = round(pos["avgCost"], 2)
-            row["unreal_pct"] = round((c - pos["avgCost"]) / pos["avgCost"] * 100, 1) if pos["avgCost"] else 0
+            # v2.3.3: defensive float casts — bridge returns sometimes vary in type
+            try:
+                ac = float(pos["avgCost"])
+                cf = float(c)
+                row["avg_cost"] = round(ac, 2)
+                row["unreal_pct"] = round((cf - ac) / ac * 100, 1) if ac else 0
+            except (TypeError, ValueError, KeyError):
+                row["avg_cost"] = pos.get("avgCost")
+                row["unreal_pct"] = 0
 
         results.append(row)
         gate_note = f" [{row['gate']}]" if row.get("gate") else ""
@@ -1825,7 +1841,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.3.2 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.3.3 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
