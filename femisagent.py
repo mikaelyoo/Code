@@ -651,6 +651,87 @@ def ceyhun_obob_signal(bars, n=5):
         return "SELL"
     return None
 
+# v2.5 — Parabolic SAR (Wilder, 1978) + Trend Trader-Remastered entry signal
+def _psar(highs, lows, start=0.02, increment=0.02, max_af=0.025):
+    """Parabolic SAR. Returns list same length as input; first value is None.
+
+    Note: the default max_af here is 0.025 (not 0.2) to match the TTR Pine
+    indicator's 'lagging' PSAR variant. Standard PSAR uses max_af=0.2.
+    """
+    n = len(highs)
+    if n < 3:
+        return [None] * n
+    psar = [None] * n
+    # Initial trend guess: compare first two bars
+    is_long = highs[1] >= highs[0]
+    af = start
+    ep = highs[1] if is_long else lows[1]
+    psar[1] = lows[0] if is_long else highs[0]
+    for i in range(2, n):
+        prev_psar = psar[i - 1]
+        if is_long:
+            new_psar = prev_psar + af * (ep - prev_psar)
+            # Constrain: PSAR can't exceed prior two bars' lows
+            new_psar = min(new_psar, lows[i - 1], lows[i - 2])
+            if highs[i] > ep:
+                ep = highs[i]
+                af = min(af + increment, max_af)
+            if lows[i] < new_psar:
+                # Trend reversal — flip to short, reset
+                is_long = False
+                psar[i] = ep
+                ep = lows[i]
+                af = start
+            else:
+                psar[i] = new_psar
+        else:
+            new_psar = prev_psar + af * (ep - prev_psar)
+            new_psar = max(new_psar, highs[i - 1], highs[i - 2])
+            if lows[i] < ep:
+                ep = lows[i]
+                af = min(af + increment, max_af)
+            if highs[i] > new_psar:
+                is_long = True
+                psar[i] = ep
+                ep = highs[i]
+                af = start
+            else:
+                psar[i] = new_psar
+    return psar
+
+def ttr_signal(bars, start=0.02, increment=0.02, max_af=0.025):
+    """Trend Trader-Remastered (Pine v6, aybarsm) — entry-only port.
+
+    Detects PSAR crossover events on the latest bar:
+      BUY  = prior PSAR was above prior high AND current high crosses above PSAR
+      SELL = prior PSAR was below prior low  AND current low  crosses below PSAR
+
+    The full Pine indicator also emits TP (take-profit at Bill Williams
+    fractal breakouts) and RE (re-entry at minimum proximity to PSAR)
+    signals, but those require a stateful position tracker across bars
+    that is out of scope for a daily-snapshot scanner. The entry-only
+    signal captures the primary trade trigger.
+
+    Default params (0.02, 0.02, 0.025) match the original Pine — the
+    unusual low max=0.025 (vs standard 0.2) makes this the 'lagging' PSAR
+    variant that's the foundation of the TTR system.
+    """
+    if len(bars) < 5:
+        return None
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    psar = _psar(highs, lows, start=start, increment=increment, max_af=max_af)
+    if psar[-1] is None or psar[-2] is None:
+        return None
+    p_prev, p_curr = psar[-2], psar[-1]
+    h_prev, h_curr = highs[-2], highs[-1]
+    l_prev, l_curr = lows[-2], lows[-1]
+    if p_prev > h_prev and h_curr > p_curr:
+        return "BUY"
+    if p_prev < l_prev and l_curr < p_curr:
+        return "SELL"
+    return None
+
 # ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
 
 _FUND_CACHE_PATH = "/data/.openclaw/workspace/memory/femisagent_fundamentals.cache.json"
@@ -1594,6 +1675,17 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     elif obob == "SELL":
         flags.append("CEYHUN_OBOB_SELL")
 
+    # v2.5 — Trend Trader-Remastered (TTR) by aybarsm, Pine v6.
+    # PSAR-based entry crossover with the indicator's unusual max=0.025
+    # 'lagging' configuration. Entry-only port; TP/RE features require
+    # stateful position tracking out of scope here. EV=0 informational
+    # until backtest calibrates, same as Ceyhun_OBOB.
+    ttr = ttr_signal(bars)
+    if ttr == "BUY":
+        flags.append("TTR_BUY")
+    elif ttr == "SELL":
+        flags.append("TTR_SELL")
+
     # v1.8.2.1 dropped vs v1.8.2:
     #   TREND_QUALITY    — fired on 47% of all bars, pure noise
     #   MULTI_CONFLUENCE_5 — -3.6pp bull WR vs baseline
@@ -1928,7 +2020,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.4 (femisapien + TA Fusion + sentiment + price-decomp + Ceyhun_OBOB) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.5 (femisapien + TAF + sentiment + price-decomp + Ceyhun_OBOB + TTR) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
