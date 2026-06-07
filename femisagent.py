@@ -1,6 +1,35 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v1.10.2 — Live FEMISAPIEN v3.8 Signal Scanner
+FEMISAGENT v2.0 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+
+v2.0 — MERGE: femisagent now orchestrates the femisapien_live_signal.py
+core engine as a backend (1h cache, subprocess invocation). Single
+entry point, both engines' signals visible per ticker. New gates layered
+on femisapien quant fields:
+
+  VPIN_TOXIC          — informed-flow toxicity > 0.7 (vpin_signal=TOXIC)
+                        demotes EXECUTE → BUY.
+  FA_MOMENTUM_EXH     — femisapien momentum_exhaustion_label REDUCE_HALF
+                        or TRIM_50 demotes EXECUTE → BUY.
+  CROSS_ASSET_RISK    — femisapien cross_asset_gate=False (SPY/sector
+                        dislocation) demotes EXECUTE → BUY.
+  LPPLS_BUBBLE_HIGH   — femisapien lppls_bubble=BUBBLE + crash_prob > 0.5
+                        demotes EXECUTE → BUY.
+  HGDCF_PFP           — hgdcf_signal=PRICED_FOR_PERFECTION adds caution
+                        flag (no auto-demote, surfaces in report).
+
+  Cross-engine confirmation:
+    FA_CONVICTION_N   — when femisapien conviction_pct >= 50, surfaces
+                        as a confirming flag (no EV change).
+
+Subprocess path: /data/.openclaw/workspace/scripts/femisapien_live_signal.py
+with --ticker SYM --json. 60s timeout per ticker. Graceful degradation:
+if the binary isn't present, subprocess times out, or output isn't
+parseable, the gate returns None and femisagent's existing rule engine
+still produces a verdict.
+
+Cache: 1h TTL keyed on symbol in the same femisagent_fundamentals.cache.json
+that holds earnings/Beneish/13F.
 
 v1.10.2 — fix inst_pct parser for new yfinance format. v1.10.1 left every
 inst_pct == None because yfinance 0.2.55+ moved the field labels into the
@@ -724,6 +753,92 @@ def get_13f_context(symbol):
     return result
 
 
+# ── v2.0 femisapien backend orchestration ───────────────────────────────────
+
+_FEMISAPIEN_PATH = os.environ.get(
+    "FEMISAPIEN_PATH",
+    "/data/.openclaw/workspace/scripts/femisapien_live_signal.py",
+)
+_FEMISAPIEN_CWD = os.environ.get(
+    "FEMISAPIEN_CWD",
+    "/data/.openclaw/workspace",
+)
+_FEMISAPIEN_TIMEOUT_SEC = 60
+_FEMISAPIEN_CACHE_TTL_SEC = 3600
+
+def get_femisapien_signals(symbol):
+    """Call femisapien_live_signal.py for the rich quant-signal set.
+
+    Returns a dict of normalized fields or None on any failure. Cached 1h
+    per ticker in the shared fundamentals cache. Graceful degradation if
+    the binary isn't present (running off-bridge), subprocess times out,
+    or output isn't JSON-parseable — femisagent's native flag engine
+    proceeds either way.
+    """
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    now_ts = datetime.now().timestamp()
+    if entry.get("femisapien_fetched_at", 0) > now_ts - _FEMISAPIEN_CACHE_TTL_SEC:
+        return entry.get("femisapien")
+    if not os.path.exists(_FEMISAPIEN_PATH):
+        entry["femisapien"] = None
+        entry["femisapien_fetched_at"] = now_ts
+        return None
+    try:
+        import subprocess, re as _re
+        result = subprocess.run(
+            [sys.executable, _FEMISAPIEN_PATH, "--ticker", symbol, "--json"],
+            capture_output=True, text=True,
+            timeout=_FEMISAPIEN_TIMEOUT_SEC,
+            cwd=_FEMISAPIEN_CWD,
+        )
+        stdout = result.stdout.strip()
+        # femisapien wraps output in [...] array — extract first object
+        m = _re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", stdout, _re.DOTALL)
+        if not m:
+            raise ValueError("no JSON object in output")
+        data = json.loads(m.group())
+        signals = {
+            "vpin": data.get("vpin"),
+            "vpin_signal": data.get("vpin_signal"),
+            "hgdcf_signal": data.get("hgdcf_signal"),
+            "hgdcf_score": data.get("hgdcf_score"),
+            "momentum_class": data.get("momentum_class"),
+            "momentum_exhaustion_label": data.get("momentum_exhaustion_label"),
+            "momentum_exhaustion_score": data.get("momentum_exhaustion_score"),
+            "technical_signal": data.get("technical_signal"),
+            "conviction_pct": data.get("conviction_pct"),
+            "final_signal": data.get("final_signal"),
+            "rationale": data.get("rationale", "")[:120],
+            "cross_asset_gate": data.get("cross_asset_gate"),
+            "earnings_block": data.get("earnings_block"),
+            "fundamental_block": data.get("fundamental_block"),
+            "lppls_bubble": data.get("lppls_bubble"),
+            "lppls_crash_prob": data.get("lppls_crash_prob"),
+            "garch_beta": data.get("garch_beta"),
+            "vol_persistence": data.get("vol_persistence"),
+            "vrp_signal": data.get("vrp_signal"),
+            "pead_signal": data.get("pead_signal"),
+            "altman_signal": data.get("altman_signal"),
+            "beneish_signal": data.get("beneish_signal"),
+            "dispersion_signal": data.get("dispersion_signal"),
+            "pin_signal": data.get("pin_signal"),
+            "distortion_score": data.get("distortion_score"),
+            "distortion_signal": data.get("distortion_signal"),
+            "regime": data.get("regime"),
+            "kelly_adjusted": data.get("kelly_adjusted"),
+            "position_size_pct": data.get("position_size_pct"),
+        }
+        entry["femisapien"] = signals
+        entry["femisapien_fetched_at"] = now_ts
+        _save_fund_cache()
+        return signals
+    except Exception:
+        entry["femisapien"] = None
+        entry["femisapien_fetched_at"] = now_ts
+        return None
+
+
 # Set of flag names known to be bullish-tilted across past calibrations.
 # Used by MULTI_CONFLUENCE_* meta-flags to count concurring bullish signals.
 _BULLISH_FLAGS = frozenset({
@@ -1197,6 +1312,53 @@ async def run(tickers=None, portfolio_mode=False):
                 row["verdict"] = "🟢 BUY"
                 row["gate"] = row.get("gate") or f"RETAIL_HEAVY_INST={inst_pct}%"
 
+        # v2.0 — femisapien cross-engine gates (quant signal layering)
+        femisapien = get_femisapien_signals(sym)
+        row["femisapien"] = femisapien
+        if femisapien:
+            # Gate 5: VPIN_TOXIC — informed-flow toxicity
+            if femisapien.get("vpin_signal") == "TOXIC":
+                row["all_flags"].append("VPIN_TOXIC_FLOW")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "VPIN_TOXIC"
+
+            # Gate 6: femisapien momentum exhaustion (REDUCE_HALF, TRIM_50)
+            exh = femisapien.get("momentum_exhaustion_label")
+            if exh in ("REDUCE_HALF", "TRIM_50", "TRIM_HALF"):
+                row["all_flags"].append(f"FA_EXH_{exh}")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or f"FA_{exh}"
+
+            # Gate 7: cross-asset dislocation (false = sector vs SPY breakdown)
+            if femisapien.get("cross_asset_gate") is False:
+                row["all_flags"].append("CROSS_ASSET_RISK")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "CROSS_ASSET"
+
+            # Gate 8: LPPLS bubble + high crash probability
+            crash_p = femisapien.get("lppls_crash_prob") or 0
+            if femisapien.get("lppls_bubble") == "BUBBLE" and crash_p > 0.5:
+                row["all_flags"].append(f"LPPLS_BUBBLE_{int(crash_p*100)}")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "LPPLS_BUBBLE"
+
+            # Gate 9: HGDCF priced-for-perfection (caution flag, no auto-demote)
+            if femisapien.get("hgdcf_signal") == "PRICED_FOR_PERFECTION":
+                row["all_flags"].append("HGDCF_PFP")
+
+            # Confirmation: femisapien strong conviction overlap
+            conv = femisapien.get("conviction_pct") or 0
+            if conv >= 50:
+                row["all_flags"].append(f"FA_CONVICTION_{int(conv)}")
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -1214,7 +1376,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v1.10.2 — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.0 (femisapien-merged) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -1267,6 +1429,29 @@ def print_report(results):
             if tf and tf.get("top_3"):
                 holders = ", ".join(h["holder"][:18] for h in tf["top_3"])
                 print(f"           top3: {holders}")
+            fa = r.get("femisapien")
+            if fa:
+                fa_bits = []
+                if fa.get("conviction_pct") is not None:
+                    fa_bits.append(f"FA_conv={fa['conviction_pct']}%")
+                if fa.get("final_signal"):
+                    fa_bits.append(f"FA={fa['final_signal']}")
+                if fa.get("momentum_class"):
+                    fa_bits.append(f"mom={fa['momentum_class']}")
+                if fa.get("momentum_exhaustion_label") and fa.get("momentum_exhaustion_score", 0) > 30:
+                    fa_bits.append(f"exh={fa['momentum_exhaustion_label']}({fa['momentum_exhaustion_score']})")
+                if fa.get("vpin_signal") and fa["vpin_signal"] != "NORMAL":
+                    fa_bits.append(f"vpin={fa['vpin_signal']}")
+                if fa.get("hgdcf_signal"):
+                    fa_bits.append(f"hgdcf={fa['hgdcf_signal']}")
+                if fa.get("lppls_bubble") and fa["lppls_bubble"] != "NONE":
+                    fa_bits.append(f"lppls={fa['lppls_bubble']}({fa.get('lppls_crash_prob',0):.2f})")
+                if fa.get("cross_asset_gate") is False:
+                    fa_bits.append("cross_asset=FAIL")
+                if fa_bits:
+                    print(f"           FA: {' | '.join(fa_bits)}")
+                if fa.get("rationale"):
+                    print(f"           FA_rationale: {fa['rationale']}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
