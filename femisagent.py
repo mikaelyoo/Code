@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v2.1 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+FEMISAGENT v2.2 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+
+v2.2 — femisapien path resolver. v2.0/v2.1 hard-coded the in-container
+path (/data/.openclaw/...) but femisagent often runs on the host where
+the same files live at /docker/openclaw-vhii/data/.openclaw/... v2.2
+checks the env override first, then both common locations, then degrades
+gracefully if neither exists.
 
 v2.1 — yfinance bar fallback. When the bridge's fetch_bars returns empty
 (IBKR Gateway down, market-data subscription lapsed, IBKR pacing throttle),
@@ -792,16 +798,32 @@ def get_13f_context(symbol):
 
 # ── v2.0 femisapien backend orchestration ───────────────────────────────────
 
-_FEMISAPIEN_PATH = os.environ.get(
-    "FEMISAPIEN_PATH",
+# v2.2: try multiple candidate paths — env override, in-container path,
+# and host bind-mount path. First existing wins.
+_FEMISAPIEN_PATH_CANDIDATES = [
+    os.environ.get("FEMISAPIEN_PATH"),
     "/data/.openclaw/workspace/scripts/femisapien_live_signal.py",
-)
-_FEMISAPIEN_CWD = os.environ.get(
-    "FEMISAPIEN_CWD",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisapien_live_signal.py",
+]
+_FEMISAPIEN_CWD_CANDIDATES = [
+    os.environ.get("FEMISAPIEN_CWD"),
     "/data/.openclaw/workspace",
-)
+    "/docker/openclaw-vhii/data/.openclaw/workspace",
+]
 _FEMISAPIEN_TIMEOUT_SEC = 60
 _FEMISAPIEN_CACHE_TTL_SEC = 3600
+
+def _resolve_femisapien_path():
+    for p in _FEMISAPIEN_PATH_CANDIDATES:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def _resolve_femisapien_cwd():
+    for p in _FEMISAPIEN_CWD_CANDIDATES:
+        if p and os.path.isdir(p):
+            return p
+    return None
 
 def get_femisapien_signals(symbol):
     """Call femisapien_live_signal.py for the rich quant-signal set.
@@ -817,17 +839,19 @@ def get_femisapien_signals(symbol):
     now_ts = datetime.now().timestamp()
     if entry.get("femisapien_fetched_at", 0) > now_ts - _FEMISAPIEN_CACHE_TTL_SEC:
         return entry.get("femisapien")
-    if not os.path.exists(_FEMISAPIEN_PATH):
+    fa_path = _resolve_femisapien_path()
+    fa_cwd = _resolve_femisapien_cwd()
+    if not fa_path:
         entry["femisapien"] = None
         entry["femisapien_fetched_at"] = now_ts
         return None
     try:
         import subprocess, re as _re
         result = subprocess.run(
-            [sys.executable, _FEMISAPIEN_PATH, "--ticker", symbol, "--json"],
+            [sys.executable, fa_path, "--ticker", symbol, "--json"],
             capture_output=True, text=True,
             timeout=_FEMISAPIEN_TIMEOUT_SEC,
-            cwd=_FEMISAPIEN_CWD,
+            cwd=fa_cwd,
         )
         stdout = result.stdout.strip()
         # femisapien wraps output in [...] array — extract first object
@@ -1418,7 +1442,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.1 (femisapien-merged + yfinance-fallback) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.2 (femisapien-merged + yfinance-fallback + host-path-resolver) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
