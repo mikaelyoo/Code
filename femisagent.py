@@ -1722,7 +1722,9 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         # next bar. Way more actionable than waiting for the actual crossover
         # on a low-frequency signal. Direction inferred from PSAR position
         # relative to price.
-        ttr_near = ttr_near_flip(bars, threshold_pct=1.0)
+        # v2.5.2: bumped to 2% — empirically NVDA at 1.39% gap to PSAR
+        # was the kind of imminent setup worth surfacing.
+        ttr_near = ttr_near_flip(bars, threshold_pct=2.0)
         if ttr_near == "BEARISH_NEAR":
             flags.append("TTR_NEAR_SELL")
         elif ttr_near == "BULLISH_NEAR":
@@ -1883,6 +1885,23 @@ async def run(tickers=None, portfolio_mode=False):
         # surfaced flags[0] and flags[1].
         all_flags = [f for f in flags
                      if f not in ("NEUTRAL", "INSUFFICIENT_DATA", "NO_DATA")]
+        # v2.5.2 — capture current PSAR value + distance so the report
+        # always shows TTR proximity to flip (not just on flag fires).
+        try:
+            _highs = [b.high for b in bars]
+            _lows = [b.low for b in bars]
+            _psar_series = _psar(_highs, _lows, 0.02, 0.02, 0.025)
+            _psar_now = _psar_series[-1]
+            if _psar_now is not None and c > 0:
+                _ttr_dist_pct = (c - _psar_now) / c * 100.0
+                _ttr_position = "below" if _psar_now < c else "above"
+            else:
+                _ttr_dist_pct = None
+                _ttr_position = None
+        except Exception:
+            _ttr_dist_pct = None
+            _ttr_position = None
+
         row = {
             "symbol":     sym,
             "price":      round(c, 2),
@@ -1891,6 +1910,9 @@ async def run(tickers=None, portfolio_mode=False):
             "flag":       primary,
             "flag2":      secondary,
             "all_flags":  all_flags,
+            "ttr_psar":   round(_psar_now, 2) if _psar_now is not None else None,
+            "ttr_dist_pct": round(_ttr_dist_pct, 2) if _ttr_dist_pct is not None else None,
+            "ttr_position": _ttr_position,
             "ev_score":   ev_score(primary),
             "verdict":    signal_verdict(primary),
             "bars":       len(bars),
@@ -2062,7 +2084,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.5.1 (6-engine + Ceyhun_OBOB + TTR + TTR_NEAR_FLIP) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.5.2 (6-engine + Ceyhun_OBOB + TTR + always-on PSAR distance) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -2097,6 +2119,13 @@ def print_report(results):
                       if f != r.get("flag") and f != r.get("flag2")]
             if extras:
                 print(f"           +flags: {', '.join(extras)}")
+            # v2.5.2 — TTR PSAR distance always shown
+            if r.get("ttr_psar") is not None and r.get("ttr_dist_pct") is not None:
+                pos = r.get("ttr_position", "?")
+                dist = r["ttr_dist_pct"]
+                # Visual cue: caution emoji when <2% from flip
+                cue = "⚠️ " if abs(dist) < 2 else ""
+                print(f"           TTR: PSAR=${r['ttr_psar']} ({pos} price, dist={dist:+.2f}%) {cue}")
             fund_bits = []
             if r.get("earnings_dte") is not None:
                 fund_bits.append(f"earnings={r['earnings_dte']}d")
