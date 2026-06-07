@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v2.3.1 — Unified multi-engine Signal Engine
+FEMISAGENT v2.3.2 — Unified multi-engine Signal Engine
+
+v2.3.2 — news_radar emoji-sentiment parser + analyst_intelligence --json:
+  - news_radar.py uses --ticker SYM (already correct) but has no --json
+    mode; output uses 🟢/🔴/⚪ emoji + media-type markers per headline.
+    v2.3.2 counts emoji+marker pairs in the ticker block and computes
+    news_score = (bull - bear) / (bull + bear + neutral).
+  - analyst_intelligence.py auto-fallback (--ticker → positional) now
+    also adds --json on the positional call for clean JSON parsing.
+  - 24h news timeframe instead of default 6h for better signal context.
 
 v2.3.1 — fix CLI conventions per backend script:
   - football_field / epv_sotp / hg_dcf use POSITIONAL ticker + --json
@@ -1044,52 +1053,76 @@ def get_sentiment_signals(symbol):
     out = {"news_score": None, "analyst_score": None, "combined_score": None,
            "news_raw": None, "analyst_raw": None}
 
-    # news_radar — try --ticker first, then positional fallback
+    # news_radar — uses --ticker SYM, 24h window, parse emoji sentiment
     news_path = _first_existing(_NEWS_RADAR_PATH_CANDIDATES)
     if news_path:
         try:
             import subprocess, re as _re
             cwd = os.path.dirname(news_path)
-            r = subprocess.run([sys.executable, news_path, "--ticker", symbol],
-                               capture_output=True, text=True, timeout=30, cwd=cwd)
-            t = (r.stdout or "")[:2000]
-            if not t.strip() or "usage:" in t.lower() or "error:" in t.lower():
-                # Try positional
-                r = subprocess.run([sys.executable, news_path, symbol],
-                                   capture_output=True, text=True, timeout=30, cwd=cwd)
-                t = (r.stdout or "")[:2000]
+            r = subprocess.run(
+                [sys.executable, news_path, "--ticker", symbol, "--timeframe", "24"],
+                capture_output=True, text=True, timeout=45, cwd=cwd,
+            )
+            t = (r.stdout or "")[:8000]
             out["news_raw"] = t[:300]
-            for pat in [r"sentiment[_ ]score[:\s]+([+-]?[\d.]+)",
-                        r"composite[:\s]+([+-]?[\d.]+)"]:
-                m = _re.search(pat, t, _re.IGNORECASE)
-                if m:
-                    try:
-                        v = float(m.group(1))
-                        if -1.5 <= v <= 1.5:
-                            out["news_score"] = round(v, 3)
-                            break
-                        if -100 <= v <= 100:
-                            out["news_score"] = round(v / 100.0, 3)
-                            break
-                    except ValueError:
-                        pass
+            # Count emoji + media-marker pairs per headline (not the legend line)
+            # 🟢/🔴/⚪ followed by any media-type emoji (📰/📄/📝/🔍/🏦/💬)
+            bull = len(_re.findall(r"🟢[📰📄📝🔍🏦💬]", t))
+            bear = len(_re.findall(r"🔴[📰📄📝🔍🏦💬]", t))
+            neut = len(_re.findall(r"⚪[📰📄📝🔍🏦💬]", t))
+            total = bull + bear + neut
+            if total > 0:
+                out["news_score"] = round((bull - bear) / total, 3)
+                out["news_headlines"] = {"bullish": bull, "bearish": bear, "neutral": neut}
         except Exception:
             pass
 
-    # analyst_intelligence — try --ticker first, then positional fallback
+    # analyst_intelligence — positional ticker + --json
     ai_path = _first_existing(_ANALYST_INT_PATH_CANDIDATES)
     if ai_path:
         try:
             import subprocess, re as _re
             cwd = os.path.dirname(ai_path)
-            r = subprocess.run([sys.executable, ai_path, "--ticker", symbol],
-                               capture_output=True, text=True, timeout=30, cwd=cwd)
-            t = (r.stdout or "")[:2000]
-            if not t.strip() or "usage:" in t.lower() or "error:" in t.lower():
-                r = subprocess.run([sys.executable, ai_path, symbol],
-                                   capture_output=True, text=True, timeout=30, cwd=cwd)
-                t = (r.stdout or "")[:2000]
+            r = subprocess.run([sys.executable, ai_path, symbol, "--json"],
+                               capture_output=True, text=True, timeout=45, cwd=cwd)
+            t = (r.stdout or "")[:4000]
             out["analyst_raw"] = t[:300]
+            # Try JSON parse first
+            json_obj = None
+            jm = _re.search(r"\{.*\}", t, _re.DOTALL)
+            if jm:
+                try: json_obj = json.loads(jm.group())
+                except Exception: pass
+            if json_obj:
+                for k in ("consensus_score", "analyst_score", "score",
+                         "buy_count", "sell_count", "hold_count",
+                         "mean_target", "current_price", "upside_pct",
+                         "strong_buy", "strong_sell", "buy", "sell", "hold"):
+                    if k in json_obj:
+                        out[f"analyst_{k}"] = json_obj[k]
+                # Derive analyst_score if not directly given
+                for sk in ("consensus_score", "analyst_score", "score"):
+                    if sk in json_obj:
+                        try:
+                            v = float(json_obj[sk])
+                            if -1.5 <= v <= 1.5:
+                                out["analyst_score"] = round(v, 3)
+                            elif -100 <= v <= 100:
+                                out["analyst_score"] = round(v / 100.0, 3)
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                if out["analyst_score"] is None:
+                    # Count-based fallback: (buys - sells) / total
+                    buys = sum(int(json_obj.get(k, 0) or 0)
+                              for k in ("strong_buy", "buy", "buy_count"))
+                    sells = sum(int(json_obj.get(k, 0) or 0)
+                               for k in ("strong_sell", "sell", "sell_count"))
+                    holds = sum(int(json_obj.get(k, 0) or 0)
+                               for k in ("hold", "hold_count"))
+                    tot = buys + sells + holds
+                    if tot > 0:
+                        out["analyst_score"] = round((buys - sells) / tot, 3)
             for pat in [r"analyst[_ ]score[:\s]+([+-]?[\d.]+)",
                         r"consensus[_ ]score[:\s]+([+-]?[\d.]+)"]:
                 m = _re.search(pat, t, _re.IGNORECASE)
@@ -1792,7 +1825,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.3.1 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.3.2 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
