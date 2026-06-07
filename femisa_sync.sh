@@ -18,11 +18,13 @@ SCRIPTS_DIR="/docker/openclaw-vhii/data/.openclaw/workspace/scripts"
 SCAN_LOG="/tmp/femisa_v283_full.log"
 BT_LOG="/tmp/femisa_backtest.log"
 
-# Default 72-ticker universe (watchlist ∪ portfolio)
+# Default 71-ticker universe (watchlist ∪ portfolio).
+# SNDK removed 2026-06-07: yfinance hangs on it (Feb-2025 spin-off from WDC,
+# limited history breaks the 60d-return computation downstream).
 DEFAULT_TICKERS=(TSLA NVDA AVGO POET RKLB ASTS PL SATS AMZN TMUS QCOM GOOGL
                  DXYZ ADI LRCX AMAT KLAC AMD TXN MU MRVL ARM INTC SNPS TSM
                  LITE AAOI AEHR NBIS COHR AMKR POWL SMTC FN VPG MP JBL HOOD
-                 CRCL CVX XLU HIMS MSFT IBIT CEG PWR MPWR FCX GLW WDC SNDK
+                 CRCL CVX XLU HIMS MSFT IBIT CEG PWR MPWR FCX GLW WDC
                  DELL HPE ON)
 
 # Flags
