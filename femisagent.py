@@ -1,6 +1,31 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v2.2 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+FEMISAGENT v2.3 — Unified multi-engine Signal Engine
+
+v2.3 — adds TA Fusion + sentiment as cross-engine backends. Three new
+quant overlays alongside femisapien:
+
+  TA Fusion (ta_fusion_consolidated.py)
+    Parses the text report (Williams%R, CCI, CMF, OBV trend/div, HL cycle).
+    New gates:
+      TAF_OVERBOUGHT     — Williams%R + CCI both fire SELL/OVERBOUGHT
+                           → demote EXECUTE to BUY (entry too late)
+      TAF_OBV_BEAR_DIV   — OBV div: BEARISH → demote EXECUTE to BUY
+      TAF_PEAK_CYCLE     — HL cycle PEAK (>30 bars) → demote EXECUTE to BUY
+    Confirmation flags (no auto-demote):
+      TAF_TROUGH_CYCLE   — HL cycle TROUGH (rare, high-EV entry timing)
+      TAF_EXECUTABLE     — TA Fusion's own "Executable: YES" + Conviction>50
+
+  Sentiment dual-backend:
+    news_radar.py        — news-headline sentiment aggregation
+    analyst_intelligence.py — analyst upgrade/downgrade sentiment
+    Each cached 6h. Combined into a single sentiment_score (-1..+1).
+    New gates:
+      SENT_NEG_HEAVY     — combined sentiment < -0.5 → demote EXECUTE to BUY
+      SENT_CONFIRM       — combined sentiment > +0.5 → confirming flag
+
+  Price decomposition (pending — env PRICE_DECOMP_PATH or hunt)
+    Skeleton in place; waiting on script identification.
 
 v2.2 — femisapien path resolver. v2.0/v2.1 hard-coded the in-container
 path (/data/.openclaw/...) but femisagent often runs on the host where
@@ -900,6 +925,232 @@ def get_femisapien_signals(symbol):
         return None
 
 
+# ── v2.3 backends: TA Fusion + sentiment (news_radar + analyst_intelligence) ──
+
+_TA_FUSION_PATH_CANDIDATES = [
+    os.environ.get("TA_FUSION_PATH"),
+    "/data/.openclaw/workspace/scripts/ta_fusion_consolidated.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/ta_fusion_consolidated.py",
+]
+_NEWS_RADAR_PATH_CANDIDATES = [
+    os.environ.get("NEWS_RADAR_PATH"),
+    "/data/.openclaw/workspace/scripts/news_radar.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/news_radar.py",
+]
+_ANALYST_INT_PATH_CANDIDATES = [
+    os.environ.get("ANALYST_INT_PATH"),
+    "/data/.openclaw/workspace/scripts/analyst_intelligence.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/analyst_intelligence.py",
+]
+_PRICE_DECOMP_PATH_CANDIDATES = [
+    os.environ.get("PRICE_DECOMP_PATH"),
+    "/data/.openclaw/workspace/scripts/epv_sotp.py",
+    "/data/.openclaw/workspace/scripts/football_field.py",
+    "/data/.openclaw/workspace/scripts/valuation_zscore.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/epv_sotp.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/football_field.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/valuation_zscore.py",
+]
+
+def _first_existing(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def _backend_cache_get(symbol, backend_name, ttl_sec):
+    """Returns (cached_value, should_refetch). Doesn't return None as cached."""
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    fetched_at = entry.get(f"{backend_name}_fetched_at", 0)
+    now_ts = datetime.now().timestamp()
+    if fetched_at > now_ts - ttl_sec:
+        cached = entry.get(backend_name)
+        if cached is not None:
+            return cached, False
+    return None, True
+
+def _backend_cache_set(symbol, backend_name, value):
+    cache = _load_fund_cache()
+    entry = cache.setdefault(symbol, {})
+    entry[backend_name] = value
+    entry[f"{backend_name}_fetched_at"] = datetime.now().timestamp()
+    # v2.3: only persist if value is not None — avoid poisoning the cache
+    if value is not None:
+        _save_fund_cache()
+
+def get_ta_fusion_signals(symbol):
+    """Run ta_fusion_consolidated.py --ticker SYM and parse its text report.
+    Returns dict with parsed indicators, or None. 1h cache."""
+    cached, refetch = _backend_cache_get(symbol, "ta_fusion", 3600)
+    if not refetch:
+        return cached
+    path = _first_existing(_TA_FUSION_PATH_CANDIDATES)
+    if not path:
+        return None
+    try:
+        import subprocess, re as _re
+        result = subprocess.run(
+            [sys.executable, path, "--ticker", symbol],
+            capture_output=True, text=True, timeout=45,
+            cwd=os.path.dirname(path),
+        )
+        out = result.stdout
+        if not out:
+            return None
+        signals = {}
+        for key, pat in [
+            ("core_signal", r"Core signal\s*:\s*(\S+)"),
+            ("conviction_pct", r"Conviction\s*:\s*([\d.]+)%"),
+            ("executable", r"Executable\s*:\s*(\S+)"),
+            ("ema_ribbon", r"EMA ribbon\s*:\s*(\S+)"),
+            ("dema", r"DEMA\s*:\s*(\S+)"),
+            ("obv_trend", r"OBV trend\s*:\s*(\S+)"),
+            ("obv_div", r"OBV trend\s*:\s*\S+\s*\|\s*div:\s*(\S+)"),
+            ("cmf_signal", r"CMF\s*:\s*[-\d.]+\s*→\s*(\S+)"),
+            ("hl_cycle", r"HL cycle\s*:\s*([\d.]+)\s*bars\s*→\s*(\S+)"),
+            ("williams_signal", r"Williams%R\s*:\s*[-\d.]+\s*→\s*(\S+)"),
+            ("cci_signal", r"CCI\s*:\s*[-\d.]+\s*→\s*(\S+)"),
+            ("vol_rsi_signal", r"Volume RSI\s*:\s*[-\d.]+\s*→\s*(\S+)"),
+            ("supplementary_consensus", r"Supplementary consensus:\s*([+-]?[\d.]+)"),
+        ]:
+            m = _re.search(pat, out)
+            if m:
+                if key == "hl_cycle":
+                    signals["hl_cycle_bars"] = float(m.group(1))
+                    signals["hl_cycle_phase"] = m.group(2)
+                elif key in ("conviction_pct", "supplementary_consensus"):
+                    try: signals[key] = float(m.group(1))
+                    except ValueError: pass
+                else:
+                    signals[key] = m.group(1)
+        _backend_cache_set(symbol, "ta_fusion", signals)
+        return signals
+    except Exception:
+        return None
+
+def get_sentiment_signals(symbol):
+    """Combined sentiment from news_radar.py + analyst_intelligence.py.
+    Returns dict with news_score, analyst_score, combined_score (-1..+1) or None.
+    Cached 6h since news/analyst views move slowly."""
+    cached, refetch = _backend_cache_get(symbol, "sentiment", 6 * 3600)
+    if not refetch:
+        return cached
+    out = {"news_score": None, "analyst_score": None, "combined_score": None,
+           "news_raw": None, "analyst_raw": None}
+
+    # news_radar
+    news_path = _first_existing(_NEWS_RADAR_PATH_CANDIDATES)
+    if news_path:
+        try:
+            import subprocess, re as _re
+            r = subprocess.run([sys.executable, news_path, "--ticker", symbol],
+                               capture_output=True, text=True, timeout=30,
+                               cwd=os.path.dirname(news_path))
+            t = (r.stdout or "")[:2000]
+            out["news_raw"] = t[:300]
+            for pat in [r"sentiment[_ ]score[:\s]+([+-]?[\d.]+)",
+                        r"composite[:\s]+([+-]?[\d.]+)"]:
+                m = _re.search(pat, t, _re.IGNORECASE)
+                if m:
+                    try:
+                        v = float(m.group(1))
+                        if -1.5 <= v <= 1.5:
+                            out["news_score"] = round(v, 3)
+                            break
+                        if -100 <= v <= 100:
+                            out["news_score"] = round(v / 100.0, 3)
+                            break
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    # analyst_intelligence
+    ai_path = _first_existing(_ANALYST_INT_PATH_CANDIDATES)
+    if ai_path:
+        try:
+            import subprocess, re as _re
+            r = subprocess.run([sys.executable, ai_path, "--ticker", symbol],
+                               capture_output=True, text=True, timeout=30,
+                               cwd=os.path.dirname(ai_path))
+            t = (r.stdout or "")[:2000]
+            out["analyst_raw"] = t[:300]
+            for pat in [r"analyst[_ ]score[:\s]+([+-]?[\d.]+)",
+                        r"consensus[_ ]score[:\s]+([+-]?[\d.]+)"]:
+                m = _re.search(pat, t, _re.IGNORECASE)
+                if m:
+                    try:
+                        v = float(m.group(1))
+                        if -1.5 <= v <= 1.5:
+                            out["analyst_score"] = round(v, 3)
+                            break
+                        if -100 <= v <= 100:
+                            out["analyst_score"] = round(v / 100.0, 3)
+                            break
+                    except ValueError:
+                        pass
+            # If no numeric score, infer from bullish/bearish word counts.
+            if out["analyst_score"] is None and t:
+                bulls = len(_re.findall(r"\b(BUY|OUTPERFORM|OVERWEIGHT|STRONG[_ ]BUY|UPGRADE)\b", t, _re.IGNORECASE))
+                bears = len(_re.findall(r"\b(SELL|UNDERPERFORM|UNDERWEIGHT|STRONG[_ ]SELL|DOWNGRADE)\b", t, _re.IGNORECASE))
+                if bulls + bears > 0:
+                    out["analyst_score"] = round((bulls - bears) / (bulls + bears), 3)
+        except Exception:
+            pass
+
+    parts = [v for v in (out["news_score"], out["analyst_score"]) if v is not None]
+    if parts:
+        out["combined_score"] = round(sum(parts) / len(parts), 3)
+        _backend_cache_set(symbol, "sentiment", out)
+        return out
+    return None
+
+def get_price_decomp_signals(symbol):
+    """Bottoms-up price decomposition. Returns dict with fair_value, gap_pct, components or None.
+    Looks for epv_sotp.py / football_field.py / valuation_zscore.py — first one wins.
+    Cached 24h since fundamentals refresh slowly."""
+    cached, refetch = _backend_cache_get(symbol, "price_decomp", 24 * 3600)
+    if not refetch:
+        return cached
+    path = _first_existing(_PRICE_DECOMP_PATH_CANDIDATES)
+    if not path:
+        return None
+    try:
+        import subprocess, re as _re
+        r = subprocess.run([sys.executable, path, "--ticker", symbol],
+                           capture_output=True, text=True, timeout=60,
+                           cwd=os.path.dirname(path))
+        t = (r.stdout or "")[:3000]
+        if not t:
+            return None
+        signals = {"backend": os.path.basename(path), "raw": t[:400]}
+        for key, pat in [
+            ("fair_value", r"(?:fair[_ ]value|intrinsic[_ ]value|target)[:\s$]+([\d.,]+)"),
+            ("current_price", r"(?:current[_ ]price|spot)[:\s$]+([\d.,]+)"),
+            ("gap_pct", r"(?:gap|upside|discount)[:\s]+([-+]?[\d.]+)%"),
+            ("zscore", r"(?:z[_-]score|zscore)[:\s]+([-+]?[\d.]+)"),
+            ("verdict", r"(?:verdict|recommendation|signal)[:\s]+([A-Z_]+)"),
+        ]:
+            m = _re.search(pat, t, _re.IGNORECASE)
+            if m:
+                try:
+                    if key in ("fair_value", "current_price"):
+                        signals[key] = float(m.group(1).replace(",", ""))
+                    elif key in ("gap_pct", "zscore"):
+                        signals[key] = float(m.group(1))
+                    else:
+                        signals[key] = m.group(1)
+                except ValueError:
+                    pass
+        if any(k in signals for k in ("fair_value", "gap_pct", "zscore", "verdict")):
+            _backend_cache_set(symbol, "price_decomp", signals)
+            return signals
+    except Exception:
+        pass
+    return None
+
+
 # Set of flag names known to be bullish-tilted across past calibrations.
 # Used by MULTI_CONFLUENCE_* meta-flags to count concurring bullish signals.
 _BULLISH_FLAGS = frozenset({
@@ -1425,6 +1676,66 @@ async def run(tickers=None, portfolio_mode=False):
             if conv >= 50:
                 row["all_flags"].append(f"FA_CONVICTION_{int(conv)}")
 
+        # v2.3 — TA Fusion cross-engine gates
+        taf = get_ta_fusion_signals(sym)
+        row["ta_fusion"] = taf
+        if taf:
+            # Overbought combo: both Williams%R and CCI flag SELL/OVERBOUGHT
+            w = (taf.get("williams_signal") or "").upper()
+            c = (taf.get("cci_signal") or "").upper()
+            if w in ("SELL",) and c in ("OVERBOUGHT",):
+                row["all_flags"].append("TAF_OVERBOUGHT")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "TAF_OVERBOUGHT"
+            # OBV bearish divergence — well-validated topping signal
+            if (taf.get("obv_div") or "").upper() == "BEARISH":
+                row["all_flags"].append("TAF_OBV_BEAR_DIV")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "TAF_OBV_BEAR_DIV"
+            # HL cycle peak (>30 bars)
+            if (taf.get("hl_cycle_phase") or "").upper() == "PEAK":
+                row["all_flags"].append("TAF_PEAK_CYCLE")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or "TAF_PEAK"
+            # Confirmation flags — no demote
+            if (taf.get("hl_cycle_phase") or "").upper() == "TROUGH":
+                row["all_flags"].append("TAF_TROUGH_CYCLE")
+            if (taf.get("executable") or "").upper() == "YES" and (taf.get("conviction_pct") or 0) >= 50:
+                row["all_flags"].append(f"TAF_EXEC_{int(taf['conviction_pct'])}")
+
+        # v2.3 — sentiment gates (news_radar + analyst_intelligence combined)
+        sent = get_sentiment_signals(sym)
+        row["sentiment"] = sent
+        if sent and sent.get("combined_score") is not None:
+            score = sent["combined_score"]
+            if score < -0.5 and row["ev_score"] >= 4:
+                row["all_flags"].append(f"SENT_NEG_{score:.2f}")
+                row["ev_score"] = min(row["ev_score"], 3.5)
+                row["verdict"] = "🟢 BUY"
+                row["gate"] = row.get("gate") or f"SENT_NEG={score:.2f}"
+            elif score > 0.5:
+                row["all_flags"].append(f"SENT_CONFIRM_{score:+.2f}")
+
+        # v2.3 — price decomposition (bottoms-up valuation)
+        pd_sig = get_price_decomp_signals(sym)
+        row["price_decomp"] = pd_sig
+        if pd_sig:
+            gap = pd_sig.get("gap_pct")
+            if gap is not None:
+                if gap < -20 and row["ev_score"] >= 4:
+                    row["all_flags"].append(f"PD_OVERVALUED_{gap:.0f}")
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or f"PD_GAP={gap:.0f}%"
+                elif gap > 20:
+                    row["all_flags"].append(f"PD_UPSIDE_{gap:+.0f}")
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -1442,7 +1753,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.2 (femisapien-merged + yfinance-fallback + host-path-resolver) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.3 (femisapien + TA Fusion + sentiment + price-decomp) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -1518,6 +1829,45 @@ def print_report(results):
                     print(f"           FA: {' | '.join(fa_bits)}")
                 if fa.get("rationale"):
                     print(f"           FA_rationale: {fa['rationale']}")
+            # v2.3 — TA Fusion display
+            taf = r.get("ta_fusion")
+            if taf:
+                taf_bits = []
+                if taf.get("core_signal"):
+                    taf_bits.append(f"core={taf['core_signal']}")
+                if taf.get("conviction_pct") is not None:
+                    taf_bits.append(f"conv={taf['conviction_pct']}%")
+                if taf.get("ema_ribbon"):
+                    taf_bits.append(f"ema={taf['ema_ribbon']}")
+                if taf.get("hl_cycle_phase"):
+                    taf_bits.append(f"cycle={taf['hl_cycle_phase']}({taf.get('hl_cycle_bars',0):.0f})")
+                if taf.get("obv_div") and taf["obv_div"].upper() != "NONE":
+                    taf_bits.append(f"obv_div={taf['obv_div']}")
+                if taf_bits:
+                    print(f"           TAF: {' | '.join(taf_bits)}")
+            # v2.3 — sentiment display
+            sent = r.get("sentiment")
+            if sent and sent.get("combined_score") is not None:
+                sb = []
+                sb.append(f"combined={sent['combined_score']:+.2f}")
+                if sent.get("news_score") is not None:
+                    sb.append(f"news={sent['news_score']:+.2f}")
+                if sent.get("analyst_score") is not None:
+                    sb.append(f"analyst={sent['analyst_score']:+.2f}")
+                print(f"           SENT: {' | '.join(sb)}")
+            # v2.3 — price decomposition display
+            pd_sig = r.get("price_decomp")
+            if pd_sig:
+                pdb = [f"src={pd_sig.get('backend','?')}"]
+                for k in ("fair_value", "current_price", "gap_pct", "zscore", "verdict"):
+                    if k in pd_sig and pd_sig[k] is not None:
+                        v = pd_sig[k]
+                        if isinstance(v, float):
+                            pdb.append(f"{k}={v:.2f}" if k != "gap_pct" else f"{k}={v:+.1f}%")
+                        else:
+                            pdb.append(f"{k}={v}")
+                if len(pdb) > 1:
+                    print(f"           PRICE_DECOMP: {' | '.join(pdb)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
