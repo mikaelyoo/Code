@@ -1272,6 +1272,23 @@ _OPTIONS_FLOW_PATH_CANDIDATES = [
     "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/options_flow.py",
 ]
 
+# v2.8 — three new Tier-1 per-ticker signal backends
+_CONGRESS_PATH_CANDIDATES = [
+    os.environ.get("CONGRESS_PATH"),
+    "/data/.openclaw/workspace/scripts/congressional_signal.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/congressional_signal.py",
+]
+_SHORT_INT_PATH_CANDIDATES = [
+    os.environ.get("SHORT_INTEREST_PATH"),
+    "/data/.openclaw/workspace/scripts/short_interest_monitor.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/short_interest_monitor.py",
+]
+_VOL_ANOMALY_PATH_CANDIDATES = [
+    os.environ.get("VOL_ANOMALY_PATH"),
+    "/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
+]
+
 def _first_existing(paths):
     for p in paths:
         if p and os.path.exists(p):
@@ -1631,6 +1648,47 @@ def get_options_flow_signals(symbol):
             ("put_volume", r"put[_ ]?volume[:\s]+([\d.,]+)"),
             ("iv_rank", r"iv[_ ]?rank[:\s]+([\d.]+)"),
             ("verdict", r"(?:options[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+        ])
+
+def get_congress_signals(symbol):
+    """congressional_signal.py — Form X disclosures of trades by members of
+    Congress (Pelosi tracker, etc). 24h cache."""
+    return _run_simple_backend(
+        symbol, _CONGRESS_PATH_CANDIDATES, ttl_sec=86400, cache_key="congress",
+        parse_keys=[
+            ("buy_count", r"(?:congress[_ ]?)?buy[_ ]?count[:\s]+(\d+)"),
+            ("sell_count", r"(?:congress[_ ]?)?sell[_ ]?count[:\s]+(\d+)"),
+            ("net_direction", r"net[_ ]?(?:direction|tilt)[:\s]+(BUY|SELL|NEUTRAL)"),
+            ("notable_trader", r"(?:notable|top)[_ ]?trader[:\s]+(\S+)"),
+            ("trade_value_usd", r"(?:total[_ ]?)?value[_ ]?usd[:\s$]+([\d.,]+)"),
+            ("last_trade_days", r"(?:last[_ ]?trade|days[_ ]?since)[:\s]+(\d+)"),
+            ("verdict", r"(?:congress[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+        ])
+
+def get_short_interest_signals(symbol):
+    """short_interest_monitor.py — FINRA short-interest data: %float,
+    days-to-cover, borrow rate. 24h cache."""
+    return _run_simple_backend(
+        symbol, _SHORT_INT_PATH_CANDIDATES, ttl_sec=86400, cache_key="short_int",
+        parse_keys=[
+            ("short_pct_float", r"short[_ ]?(?:pct[_ ]?float|percent)[:\s]+([\d.]+)%?"),
+            ("days_to_cover", r"days[_ ]?to[_ ]?cover[:\s]+([\d.]+)"),
+            ("borrow_rate", r"borrow[_ ]?rate[:\s]+([\d.]+)%?"),
+            ("si_change_qoq", r"(?:si|short)[_ ]?change[_ ]?qoq[:\s]+([+-]?[\d.]+)%?"),
+            ("squeeze_score", r"squeeze[_ ]?score[:\s]+([\d.]+)"),
+            ("verdict", r"(?:short[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+        ])
+
+def get_volume_anomaly_signals(symbol):
+    """volume_anomaly_monitor.py — volume z-score outliers vs 20-day avg.
+    1h cache (intraday relevance)."""
+    return _run_simple_backend(
+        symbol, _VOL_ANOMALY_PATH_CANDIDATES, ttl_sec=3600, cache_key="vol_anomaly",
+        parse_keys=[
+            ("volume_zscore", r"(?:volume[_ ]?)?z[_-]?score[:\s]+([+-]?[\d.]+)"),
+            ("vol_ratio", r"vol[_ ]?ratio[:\s]+([\d.]+)x?"),
+            ("anomaly_type", r"anomaly[_ ]?type[:\s]+(SURGE|COLLAPSE|NORMAL|NONE)"),
+            ("verdict", r"(?:volume[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
         ])
 
 
@@ -2332,6 +2390,55 @@ async def run(tickers=None, portfolio_mode=False):
                 except (ValueError, TypeError):
                     pass
 
+        # v2.8 — Congressional trades (Pelosi-style tracker)
+        cong = get_congress_signals(sym)
+        row["congress"] = cong
+        if cong:
+            cbuy = int(cong.get("buy_count", 0) or 0)
+            csell = int(cong.get("sell_count", 0) or 0)
+            cdir = (cong.get("net_direction") or "").upper()
+            if cbuy >= 2 and (cdir == "BUY" or cbuy > csell):
+                row["all_flags"].append(f"CONGRESS_BUY_{cbuy}")
+            elif csell >= 2 and (cdir == "SELL" or csell > cbuy):
+                row["all_flags"].append(f"CONGRESS_SELL_{csell}")
+                if row["ev_score"] >= 4:
+                    row["ev_score"] = min(row["ev_score"], 3.5)
+                    row["verdict"] = "🟢 BUY"
+                    row["gate"] = row.get("gate") or f"CONGRESS_SELL_{csell}"
+
+        # v2.8 — Short interest (squeeze risk)
+        si = get_short_interest_signals(sym)
+        row["short_int"] = si
+        if si:
+            spct = si.get("short_pct_float")
+            dtc = si.get("days_to_cover")
+            try:
+                spct = float(spct) if spct is not None else None
+                dtc = float(dtc) if dtc is not None else None
+                if spct is not None and dtc is not None:
+                    if spct > 20 and dtc > 5:
+                        row["all_flags"].append(f"SHORT_SQUEEZE_RISK_si{spct:.0f}_dtc{dtc:.1f}")
+                    elif spct > 15:
+                        row["all_flags"].append(f"SHORT_ELEVATED_{spct:.0f}")
+            except (ValueError, TypeError):
+                pass
+
+        # v2.8 — Volume anomaly (z-score outliers vs 20-day avg)
+        vola = get_volume_anomaly_signals(sym)
+        row["vol_anomaly"] = vola
+        if vola:
+            z = vola.get("volume_zscore")
+            atype = (vola.get("anomaly_type") or "").upper()
+            try:
+                z = float(z) if z is not None else None
+                if z is not None:
+                    if z > 3 or atype == "SURGE":
+                        row["all_flags"].append(f"VOL_ANOMALY_SURGE_z{z:.1f}")
+                    elif z < -2 or atype == "COLLAPSE":
+                        row["all_flags"].append(f"VOL_ANOMALY_COLLAPSE_z{z:.1f}")
+            except (ValueError, TypeError):
+                pass
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -2356,7 +2463,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.7 (11-engine + insider/EPS_rev/options_flow) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.8 (18-engine + Congress/Short_Int/Vol_Anomaly) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -2516,6 +2623,44 @@ def print_report(results):
                     except (ValueError, TypeError): pass
                 if ob:
                     print(f"           OPTIONS: {' | '.join(ob)}")
+            # v2.8 displays
+            cong = r.get("congress")
+            if cong:
+                cb = []
+                if cong.get("buy_count") is not None:
+                    cb.append(f"buys={cong['buy_count']}")
+                if cong.get("sell_count") is not None:
+                    cb.append(f"sells={cong['sell_count']}")
+                if cong.get("net_direction"):
+                    cb.append(f"net={cong['net_direction']}")
+                if cong.get("notable_trader"):
+                    cb.append(f"top={cong['notable_trader']}")
+                if cb:
+                    print(f"           CONGRESS: {' | '.join(cb)}")
+            si = r.get("short_int")
+            if si:
+                sb = []
+                if si.get("short_pct_float") is not None:
+                    try: sb.append(f"SI={float(si['short_pct_float']):.1f}%float")
+                    except (ValueError, TypeError): pass
+                if si.get("days_to_cover") is not None:
+                    try: sb.append(f"DTC={float(si['days_to_cover']):.1f}d")
+                    except (ValueError, TypeError): pass
+                if si.get("borrow_rate") is not None:
+                    try: sb.append(f"borrow={float(si['borrow_rate']):.1f}%")
+                    except (ValueError, TypeError): pass
+                if sb:
+                    print(f"           SHORT_INT: {' | '.join(sb)}")
+            vola = r.get("vol_anomaly")
+            if vola:
+                vb = []
+                if vola.get("volume_zscore") is not None:
+                    try: vb.append(f"z={float(vola['volume_zscore']):+.1f}")
+                    except (ValueError, TypeError): pass
+                if vola.get("anomaly_type"):
+                    vb.append(f"type={vola['anomaly_type']}")
+                if vb:
+                    print(f"           VOL_ANOMALY: {' | '.join(vb)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
