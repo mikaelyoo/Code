@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-FEMISAGENT v2.0 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+FEMISAGENT v2.1 — Unified FEMISAPIEN v3.8 + femisagent Signal Engine
+
+v2.1 — yfinance bar fallback. When the bridge's fetch_bars returns empty
+(IBKR Gateway down, market-data subscription lapsed, IBKR pacing throttle),
+femisagent transparently falls back to yfinance daily bars (15-min delayed
+for free tier). Caches + flag logic + all gates unchanged. This kills the
+"insufficient data (0 bars)" failure mode that wiped portfolio scans when
+IBKR's fetch_bars was silent.
 
 v2.0 — MERGE: femisagent now orchestrates the femisapien_live_signal.py
 core engine as a backend (1h cache, subprocess invocation). Single
@@ -380,6 +387,36 @@ def fetch_bars_via_bridge(symbol):
     except Exception:
         pass
     return []
+
+def _fetch_bars_via_yfinance(symbol, days=90):
+    """v2.1 fallback when bridge fetch_bars returns []. yfinance daily bars,
+    wrapped in the same Bar shape as the bridge path. Returns [] on any
+    failure (no network, ticker invalid, yfinance not installed).
+    """
+    yf = _yf()
+    if yf is None:
+        return []
+    try:
+        df = _yf_call(lambda: yf.Ticker(symbol).history(period=f"{days}d", auto_adjust=False))
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return []
+        bars = []
+        for ts, row in df.iterrows():
+            try:
+                bars.append(make_bar_obj({
+                    "date": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                    "volume": float(row["Volume"]),
+                }))
+            except (KeyError, ValueError):
+                continue
+        return bars
+    except Exception:
+        return []
+
 
 def get_positions_via_bridge():
     """Fetch portfolio positions via the bridge's get_positions MCP tool.
@@ -1147,6 +1184,11 @@ async def fetch_bars(ib, ticker, exchange="SMART", currency="USD"):
         raw = fetch_bars_via_bridge(ticker)
         if raw:
             return [make_bar_obj(d) for d in raw]
+        # v2.1: bridge returned empty — yfinance fallback
+        yf_bars = _fetch_bars_via_yfinance(ticker)
+        if yf_bars:
+            return yf_bars
+        return []
     from ib_insync import Stock
     contract = Stock(ticker, exchange, currency)
     try:
@@ -1376,7 +1418,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.0 (femisapien-merged) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.1 (femisapien-merged + yfinance-fallback) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
