@@ -1288,6 +1288,11 @@ _VOL_ANOMALY_PATH_CANDIDATES = [
     "/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
     "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
 ]
+_ADAPTIVE_PRED_PATH_CANDIDATES = [
+    os.environ.get("ADAPTIVE_PRED_PATH"),
+    "/data/.openclaw/workspace/scripts/adaptive_predictor.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/adaptive_predictor.py",
+]
 
 def _first_existing(paths):
     for p in paths:
@@ -1665,30 +1670,110 @@ def get_congress_signals(symbol):
             ("verdict", r"(?:congress[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
         ])
 
+# v2.8.1 — portfolio-scan backends: run ONCE per femisagent invocation,
+# parse all tickers from output, lookup per-ticker.
+_PORTFOLIO_SCAN_CACHE = {}
+
+def _run_portfolio_scan(scan_key, candidates, args, parser_fn):
+    """Run a portfolio-wide scan script once per femisagent process.
+    `parser_fn(stdout)` returns dict[ticker -> signals].
+    Cached in _PORTFOLIO_SCAN_CACHE for the lifetime of this process."""
+    if scan_key in _PORTFOLIO_SCAN_CACHE:
+        return _PORTFOLIO_SCAN_CACHE[scan_key]
+    path = _first_existing(candidates)
+    if not path:
+        _PORTFOLIO_SCAN_CACHE[scan_key] = {}
+        return {}
+    try:
+        import subprocess
+        r = subprocess.run([sys.executable, path] + (args or []),
+                           capture_output=True, text=True, timeout=180,
+                           cwd=os.path.dirname(path))
+        per_ticker = parser_fn(r.stdout or "") or {}
+        _PORTFOLIO_SCAN_CACHE[scan_key] = per_ticker
+        return per_ticker
+    except Exception:
+        _PORTFOLIO_SCAN_CACHE[scan_key] = {}
+        return {}
+
+def _parse_short_interest_output(text):
+    """Format observed (v2.8.1):
+      TICKER   SHORT%   vs.AVG    D2C  SHARES_S    MoM%    SQ  RISK
+      CRWV     17.1%   +2.1pp    1.8     51.4M   -20.4%  100  🟠 HIGH
+    """
+    import re
+    out = {}
+    for line in text.splitlines():
+        m = re.match(
+            r"^\s*([A-Z]{1,5})\s+([\d.]+)%\s+([+-]?[\d.]+)pp\s+"
+            r"([\d.]+)\s+([\d.]+)M?\s+([+-]?[\d.]+)%\s+(\d+)\s+\S+\s+(\w+)",
+            line)
+        if m:
+            sym, si, vsavg, dtc, shares, mom, sq, risk = m.groups()
+            out[sym] = {
+                "short_pct_float": float(si),
+                "vs_avg_pp": float(vsavg),
+                "days_to_cover": float(dtc),
+                "shares_short_M": float(shares),
+                "mom_change_pct": float(mom),
+                "squeeze_score": int(sq),
+                "risk_label": risk,
+            }
+    return out
+
+def _parse_volume_anomaly_output(text):
+    """Format observed (v2.8.1):
+      [vol] ⚡ GDX: 🔴 ALERT vol_z=3.07 price_z=-0.42
+      [vol] ⚡ LRCX: 🔴 ALERT vol_z=3.59 price_z=-1.25
+      [vol] ⚡ QQQM: 🟡 WATCH vol_z=2.29 price_z=-1.08
+    """
+    import re
+    out = {}
+    for line in text.splitlines():
+        m = re.search(
+            r"\[vol\]\s+\S+\s+([A-Z]{1,5}):\s+\S+\s+(ALERT|WATCH)\s+"
+            r"vol_z=([+-]?[\d.]+)\s+price_z=([+-]?[\d.]+)",
+            line)
+        if m:
+            sym, level, vz, pz = m.groups()
+            out[sym] = {
+                "alert_level": level,
+                "volume_zscore": float(vz),
+                "price_zscore": float(pz),
+                "anomaly_type": "SURGE" if float(vz) > 3 else "WATCH",
+            }
+    return out
+
 def get_short_interest_signals(symbol):
-    """short_interest_monitor.py — FINRA short-interest data: %float,
-    days-to-cover, borrow rate. 24h cache."""
-    return _run_simple_backend(
-        symbol, _SHORT_INT_PATH_CANDIDATES, ttl_sec=86400, cache_key="short_int",
-        parse_keys=[
-            ("short_pct_float", r"short[_ ]?(?:pct[_ ]?float|percent)[:\s]+([\d.]+)%?"),
-            ("days_to_cover", r"days[_ ]?to[_ ]?cover[:\s]+([\d.]+)"),
-            ("borrow_rate", r"borrow[_ ]?rate[:\s]+([\d.]+)%?"),
-            ("si_change_qoq", r"(?:si|short)[_ ]?change[_ ]?qoq[:\s]+([+-]?[\d.]+)%?"),
-            ("squeeze_score", r"squeeze[_ ]?score[:\s]+([\d.]+)"),
-            ("verdict", r"(?:short[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
-        ])
+    """v2.8.1: short_interest_monitor.py is portfolio-wide (no --ticker
+    flag). Runs once with --no-ibkr; parses all tickers from output table."""
+    return _run_portfolio_scan(
+        "short_interest", _SHORT_INT_PATH_CANDIDATES, ["--no-ibkr"],
+        _parse_short_interest_output
+    ).get(symbol)
 
 def get_volume_anomaly_signals(symbol):
-    """volume_anomaly_monitor.py — volume z-score outliers vs 20-day avg.
-    1h cache (intraday relevance)."""
+    """v2.8.1: volume_anomaly_monitor.py is portfolio-wide (no --ticker
+    flag). Runs once with --dry-run --force; parses all alert lines."""
+    return _run_portfolio_scan(
+        "vol_anomaly", _VOL_ANOMALY_PATH_CANDIDATES, ["--dry-run", "--force"],
+        _parse_volume_anomaly_output
+    ).get(symbol)
+
+def get_adaptive_predictor_signals(symbol):
+    """adaptive_predictor.py — ML-based return predictor. 6h cache.
+    CLI unknown; _run_simple_backend tries --ticker SYM --json first,
+    then positional, then bare invocations."""
     return _run_simple_backend(
-        symbol, _VOL_ANOMALY_PATH_CANDIDATES, ttl_sec=3600, cache_key="vol_anomaly",
+        symbol, _ADAPTIVE_PRED_PATH_CANDIDATES, ttl_sec=6 * 3600,
+        cache_key="adaptive_pred",
         parse_keys=[
-            ("volume_zscore", r"(?:volume[_ ]?)?z[_-]?score[:\s]+([+-]?[\d.]+)"),
-            ("vol_ratio", r"vol[_ ]?ratio[:\s]+([\d.]+)x?"),
-            ("anomaly_type", r"anomaly[_ ]?type[:\s]+(SURGE|COLLAPSE|NORMAL|NONE)"),
-            ("verdict", r"(?:volume[_ ]?signal|verdict)[:\s]+([A-Z_]+)"),
+            ("predicted_return_pct", r"(?:predicted|forecast)[_ ]?return[:\s]+([+-]?[\d.]+)%?"),
+            ("confidence", r"confidence[:\s]+([\d.]+)%?"),
+            ("direction", r"(?:direction|signal)[:\s]+(UP|DOWN|FLAT|BUY|SELL|HOLD)"),
+            ("model", r"model[:\s]+(\S+)"),
+            ("horizon_days", r"horizon[_ ]?days?[:\s]+(\d+)"),
+            ("verdict", r"(?:predictor[_ ]?verdict|verdict)[:\s]+([A-Z_]+)"),
         ])
 
 
@@ -2439,6 +2524,26 @@ async def run(tickers=None, portfolio_mode=False):
             except (ValueError, TypeError):
                 pass
 
+        # v2.8.1 — Adaptive predictor (ML-based return forecast)
+        adp = get_adaptive_predictor_signals(sym)
+        row["adaptive_pred"] = adp
+        if adp:
+            pred_ret = adp.get("predicted_return_pct")
+            direction = (adp.get("direction") or "").upper()
+            try:
+                pred_ret = float(pred_ret) if pred_ret is not None else None
+                if pred_ret is not None:
+                    if pred_ret <= -5 or direction in ("DOWN", "SELL"):
+                        row["all_flags"].append(f"ADP_PRED_DOWN_{pred_ret:+.1f}")
+                        if row["ev_score"] >= 4:
+                            row["ev_score"] = min(row["ev_score"], 3.5)
+                            row["verdict"] = "🟢 BUY"
+                            row["gate"] = row.get("gate") or f"ADP_PRED={pred_ret:+.1f}%"
+                    elif pred_ret >= 5 or direction in ("UP", "BUY"):
+                        row["all_flags"].append(f"ADP_PRED_UP_{pred_ret:+.1f}")
+            except (ValueError, TypeError):
+                pass
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -2463,7 +2568,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.8 (18-engine + Congress/Short_Int/Vol_Anomaly) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.8.1 (19-engine + portfolio-scan + Adaptive_Predictor) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -2661,6 +2766,23 @@ def print_report(results):
                     vb.append(f"type={vola['anomaly_type']}")
                 if vb:
                     print(f"           VOL_ANOMALY: {' | '.join(vb)}")
+            adp = r.get("adaptive_pred")
+            if adp:
+                ab = []
+                if adp.get("predicted_return_pct") is not None:
+                    try: ab.append(f"pred={float(adp['predicted_return_pct']):+.1f}%")
+                    except (ValueError, TypeError): pass
+                if adp.get("confidence") is not None:
+                    try: ab.append(f"conf={float(adp['confidence']):.0f}%")
+                    except (ValueError, TypeError): pass
+                if adp.get("direction"):
+                    ab.append(f"dir={adp['direction']}")
+                if adp.get("model"):
+                    ab.append(f"model={adp['model']}")
+                if adp.get("horizon_days") is not None:
+                    ab.append(f"horizon={adp['horizon_days']}d")
+                if ab:
+                    print(f"           ADAPTIVE_PRED: {' | '.join(ab)}")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
