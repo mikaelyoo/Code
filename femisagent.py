@@ -1629,17 +1629,12 @@ def get_insider_signals(symbol):
         ])
 
 def get_eps_revision_signals(symbol):
-    """earnings_revision_tracker.py — analyst EPS estimate revisions. 12h cache."""
-    return _run_simple_backend(
-        symbol, _EPS_REV_PATH_CANDIDATES, ttl_sec=12 * 3600, cache_key="eps_rev",
-        parse_keys=[
-            ("revision_direction", r"(?:revision[_ ]?direction|trend)[:\s]+(UP|DOWN|FLAT|MIXED)"),
-            ("revision_magnitude", r"(?:revision[_ ]?magnitude|change)[:\s]+([+-]?[\d.]+)%?"),
-            ("up_count", r"up[_ ]?(?:count|revisions)[:\s]+(\d+)"),
-            ("down_count", r"down[_ ]?(?:count|revisions)[:\s]+(\d+)"),
-            ("revision_score", r"(?:revision|momentum)[_ ]?score[:\s]+([+-]?\d+)"),
-            ("eps_surprise_last", r"(?:eps[_ ]?surprise|last[_ ]?surprise)[:\s]+([+-]?[\d.]+)%?"),
-        ])
+    """v2.8.3: earnings_revision_tracker.py is portfolio-scan (32 default
+    tickers, no --ticker flag). Runs once per scan; lookup per ticker."""
+    return _run_portfolio_scan(
+        "eps_rev", _EPS_REV_PATH_CANDIDATES, [],
+        _parse_eps_rev_output
+    ).get(symbol)
 
 def get_options_flow_signals(symbol):
     """options_flow.py — unusual options flow / put-call analysis. 6h cache."""
@@ -1746,25 +1741,57 @@ def _parse_volume_anomaly_output(text):
     return out
 
 def _parse_ai_picks_output(text):
-    """v2.8.2: ai_picks.py outputs top-5 AI narrative stock picks daily.
-    Format is WhatsApp-ready text. We parse out the picked tickers and
-    surface AI_PICK_TOP5 as a confirming flag on any held/scanned ticker
-    that appears in the list."""
+    """v2.8.3: ai_picks.py outputs top-N AI narrative picks. Actual format:
+        *#8 LRCX — Lam Research*
+          Theme: Semiconductor Equipment
+          Score: 71.8/100
+    Parser extracts rank + ticker + score for each entry."""
     import re
     out = {}
-    # Match common patterns: numbered list "1. TICKER", "* TICKER", "🥇 TICKER",
-    # or just any uppercase ticker symbol on its own line in a section.
-    for line in text.splitlines():
-        # Pattern 1: numbered/bulleted ticker
-        m = re.match(r"^\s*(?:[1-9][.)] |[*-] |🥇|🥈|🥉|🏆)\s*([A-Z]{2,5})\b", line)
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        # Match the *#N TICKER — Company* header
+        m = re.match(r"^\s*\*?#(\d+)\s+([A-Z]{1,5})\s*[—\-–]", line)
         if not m:
-            # Pattern 2: bold ticker like *NVDA* or **NVDA**
-            m = re.search(r"\*+\s*([A-Z]{2,5})\s*\*+", line)
+            continue
+        rank, sym = int(m.group(1)), m.group(2)
+        # Look ahead a few lines for the Score: line
+        score = None
+        for j in range(i, min(i + 12, len(lines))):
+            sm = re.search(r"Score[:\s]+([\d.]+)\s*/\s*100", lines[j])
+            if sm:
+                score = float(sm.group(1))
+                break
+        out[sym] = {"ai_pick_top5": True, "rank": rank, "score": score}
+    return out
+
+def _parse_eps_rev_output(text):
+    """v2.8.3: earnings_revision_tracker.py outputs per-ticker EPS revision
+    progress. Currently captures tickers that were processed; future versions
+    of the script may expose per-ticker scores.
+
+    Lines look like:
+      → AAOI... ✓
+      → ALAB... ✓
+    """
+    import re
+    out = {}
+    for line in text.splitlines():
+        m = re.search(r"→\s+([A-Z]{1,5})\.\.\.", line)
         if m:
+            out[m.group(1)] = {"tracked": True}
+    # If a structured section exists later, parse it
+    for line in text.splitlines():
+        m = re.match(
+            r"^\s*([A-Z]{1,5})\s+(?:\|\s*)?(?:dir[:=]\s*)?(UP|DOWN|FLAT|MIXED)?"
+            r"\s*(?:score[:=]\s*([+-]?\d+))?",
+            line)
+        if m and m.group(1) in out:
             sym = m.group(1)
-            # Exclude common false positives
-            if sym not in ("USD", "USA", "ETF", "AI", "OK", "GDP", "Q1", "Q2", "Q3", "Q4"):
-                out[sym] = {"ai_pick_top5": True, "rank": len(out) + 1}
+            if m.group(2):
+                out[sym]["revision_direction"] = m.group(2)
+            if m.group(3):
+                out[sym]["revision_score"] = int(m.group(3))
     return out
 
 def get_short_interest_signals(symbol):
@@ -2571,7 +2598,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.8.2 (19-engine + AI_Picks equity predictor) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.8.3 (19-engine + ai_picks rank parser + eps_rev portfolio-scan) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
