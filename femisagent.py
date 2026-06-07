@@ -1288,10 +1288,10 @@ _VOL_ANOMALY_PATH_CANDIDATES = [
     "/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
     "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/volume_anomaly_monitor.py",
 ]
-_ADAPTIVE_PRED_PATH_CANDIDATES = [
-    os.environ.get("ADAPTIVE_PRED_PATH"),
-    "/data/.openclaw/workspace/scripts/adaptive_predictor.py",
-    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/adaptive_predictor.py",
+_AI_PICKS_PATH_CANDIDATES = [
+    os.environ.get("AI_PICKS_PATH"),
+    "/data/.openclaw/workspace/scripts/ai_picks.py",
+    "/docker/openclaw-vhii/data/.openclaw/workspace/scripts/ai_picks.py",
 ]
 
 def _first_existing(paths):
@@ -1724,14 +1724,15 @@ def _parse_short_interest_output(text):
 def _parse_volume_anomaly_output(text):
     """Format observed (v2.8.1):
       [vol] ⚡ GDX: 🔴 ALERT vol_z=3.07 price_z=-0.42
-      [vol] ⚡ LRCX: 🔴 ALERT vol_z=3.59 price_z=-1.25
-      [vol] ⚡ QQQM: 🟡 WATCH vol_z=2.29 price_z=-1.08
+
+    v2.8.2: Use .*? instead of \\S+\\s+ to handle multi-codepoint emojis
+    that Python's \\S can stumble on.
     """
     import re
     out = {}
     for line in text.splitlines():
         m = re.search(
-            r"\[vol\]\s+\S+\s+([A-Z]{1,5}):\s+\S+\s+(ALERT|WATCH)\s+"
+            r"\[vol\].*?([A-Z]{1,5}):.*?(ALERT|WATCH)\s+"
             r"vol_z=([+-]?[\d.]+)\s+price_z=([+-]?[\d.]+)",
             line)
         if m:
@@ -1742,6 +1743,28 @@ def _parse_volume_anomaly_output(text):
                 "price_zscore": float(pz),
                 "anomaly_type": "SURGE" if float(vz) > 3 else "WATCH",
             }
+    return out
+
+def _parse_ai_picks_output(text):
+    """v2.8.2: ai_picks.py outputs top-5 AI narrative stock picks daily.
+    Format is WhatsApp-ready text. We parse out the picked tickers and
+    surface AI_PICK_TOP5 as a confirming flag on any held/scanned ticker
+    that appears in the list."""
+    import re
+    out = {}
+    # Match common patterns: numbered list "1. TICKER", "* TICKER", "🥇 TICKER",
+    # or just any uppercase ticker symbol on its own line in a section.
+    for line in text.splitlines():
+        # Pattern 1: numbered/bulleted ticker
+        m = re.match(r"^\s*(?:[1-9][.)] |[*-] |🥇|🥈|🥉|🏆)\s*([A-Z]{2,5})\b", line)
+        if not m:
+            # Pattern 2: bold ticker like *NVDA* or **NVDA**
+            m = re.search(r"\*+\s*([A-Z]{2,5})\s*\*+", line)
+        if m:
+            sym = m.group(1)
+            # Exclude common false positives
+            if sym not in ("USD", "USA", "ETF", "AI", "OK", "GDP", "Q1", "Q2", "Q3", "Q4"):
+                out[sym] = {"ai_pick_top5": True, "rank": len(out) + 1}
     return out
 
 def get_short_interest_signals(symbol):
@@ -1760,21 +1783,14 @@ def get_volume_anomaly_signals(symbol):
         _parse_volume_anomaly_output
     ).get(symbol)
 
-def get_adaptive_predictor_signals(symbol):
-    """adaptive_predictor.py — ML-based return predictor. 6h cache.
-    CLI unknown; _run_simple_backend tries --ticker SYM --json first,
-    then positional, then bare invocations."""
-    return _run_simple_backend(
-        symbol, _ADAPTIVE_PRED_PATH_CANDIDATES, ttl_sec=6 * 3600,
-        cache_key="adaptive_pred",
-        parse_keys=[
-            ("predicted_return_pct", r"(?:predicted|forecast)[_ ]?return[:\s]+([+-]?[\d.]+)%?"),
-            ("confidence", r"confidence[:\s]+([\d.]+)%?"),
-            ("direction", r"(?:direction|signal)[:\s]+(UP|DOWN|FLAT|BUY|SELL|HOLD)"),
-            ("model", r"model[:\s]+(\S+)"),
-            ("horizon_days", r"horizon[_ ]?days?[:\s]+(\d+)"),
-            ("verdict", r"(?:predictor[_ ]?verdict|verdict)[:\s]+([A-Z_]+)"),
-        ])
+def get_ai_picks_signals(symbol):
+    """v2.8.2: ai_picks.py is a portfolio-wide screener that returns the
+    top-5 AI-narrative stock picks daily. Runs once per scan, returns a
+    flag only if the queried ticker is in today's top-5."""
+    return _run_portfolio_scan(
+        "ai_picks", _AI_PICKS_PATH_CANDIDATES, [],
+        _parse_ai_picks_output
+    ).get(symbol)
 
 
 # Set of flag names known to be bullish-tilted across past calibrations.
@@ -2524,25 +2540,12 @@ async def run(tickers=None, portfolio_mode=False):
             except (ValueError, TypeError):
                 pass
 
-        # v2.8.1 — Adaptive predictor (ML-based return forecast)
-        adp = get_adaptive_predictor_signals(sym)
-        row["adaptive_pred"] = adp
-        if adp:
-            pred_ret = adp.get("predicted_return_pct")
-            direction = (adp.get("direction") or "").upper()
-            try:
-                pred_ret = float(pred_ret) if pred_ret is not None else None
-                if pred_ret is not None:
-                    if pred_ret <= -5 or direction in ("DOWN", "SELL"):
-                        row["all_flags"].append(f"ADP_PRED_DOWN_{pred_ret:+.1f}")
-                        if row["ev_score"] >= 4:
-                            row["ev_score"] = min(row["ev_score"], 3.5)
-                            row["verdict"] = "🟢 BUY"
-                            row["gate"] = row.get("gate") or f"ADP_PRED={pred_ret:+.1f}%"
-                    elif pred_ret >= 5 or direction in ("UP", "BUY"):
-                        row["all_flags"].append(f"ADP_PRED_UP_{pred_ret:+.1f}")
-            except (ValueError, TypeError):
-                pass
+        # v2.8.2 — AI Picks daily narrative screener (replaces v2.8.1 adaptive_predictor)
+        ai_pick = get_ai_picks_signals(sym)
+        row["ai_pick"] = ai_pick
+        if ai_pick:
+            rank = ai_pick.get("rank", 0)
+            row["all_flags"].append(f"AI_PICK_TOP5_RANK{rank}")
 
         if sym in portfolio_data:
             pos = portfolio_data[sym]
@@ -2568,7 +2571,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.8.1 (19-engine + portfolio-scan + Adaptive_Predictor) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.8.2 (19-engine + AI_Picks equity predictor) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
@@ -2766,23 +2769,9 @@ def print_report(results):
                     vb.append(f"type={vola['anomaly_type']}")
                 if vb:
                     print(f"           VOL_ANOMALY: {' | '.join(vb)}")
-            adp = r.get("adaptive_pred")
-            if adp:
-                ab = []
-                if adp.get("predicted_return_pct") is not None:
-                    try: ab.append(f"pred={float(adp['predicted_return_pct']):+.1f}%")
-                    except (ValueError, TypeError): pass
-                if adp.get("confidence") is not None:
-                    try: ab.append(f"conf={float(adp['confidence']):.0f}%")
-                    except (ValueError, TypeError): pass
-                if adp.get("direction"):
-                    ab.append(f"dir={adp['direction']}")
-                if adp.get("model"):
-                    ab.append(f"model={adp['model']}")
-                if adp.get("horizon_days") is not None:
-                    ab.append(f"horizon={adp['horizon_days']}d")
-                if ab:
-                    print(f"           ADAPTIVE_PRED: {' | '.join(ab)}")
+            ap = r.get("ai_pick")
+            if ap:
+                print(f"           AI_PICK: 🏆 TOP-5 (rank #{ap.get('rank','?')})")
 
     print("\n" + "="*80)
     print(f"Scanned {len(results)} tickers | "
