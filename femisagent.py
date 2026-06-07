@@ -557,6 +557,31 @@ def _rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100.0 - 100.0 / (1.0 + rs)
 
+def _rsi_series(closes, period=14):
+    """Wilder's RSI series — returns one value per bar (None for first `period`).
+    Needed by divergence detectors that compare past RSI values."""
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+    series = [None] * n
+    gains, losses = [], []
+    for i in range(1, n):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    series[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + (avg_gain / avg_loss))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            series[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            series[i + 1] = 100.0 - 100.0 / (1.0 + rs)
+    return series
+
 def _atr(highs, lows, closes, period=14):
     """Wilder's ATR. Returns 0 for insufficient data."""
     if len(closes) < period + 1:
@@ -762,6 +787,52 @@ def ttr_near_flip(bars, threshold_pct=1.0, start=0.02, increment=0.02, max_af=0.
         return "BULLISH_NEAR"   # price below PSAR, about to break above
     if p < c:
         return "BEARISH_NEAR"   # price above PSAR, about to break below
+    return None
+
+def libertus_rsi_div_signal(bars, length=14, xbars=90, recent_window=5):
+    """Libertus RSI Divergence (Pine v4 port, Libertus 2021) — detects
+    bullish/bearish divergence between 14-period RSI and price.
+
+    Bearish: price made HIGHER HIGH in recent window vs prior window,
+             but RSI made LOWER HIGH (momentum weakening despite price rise)
+    Bullish: price made LOWER LOW, but RSI made HIGHER LOW (selling
+             pressure waning despite price drop)
+
+    Returns 'BULL_DIV', 'BEAR_DIV', or None for the most recent bar.
+
+    The original Pine maintained per-bar running max/min state with
+    `highestbars(rsi, xbars)`; this port uses a simpler window-comparison
+    approach that captures the same decision logic without bar-by-bar
+    state simulation. xbars=90 lookback, recent_window=5 bars for the
+    "now" comparison vs the prior 85-bar window.
+    """
+    if len(bars) < length + xbars:
+        return None
+    closes = [b.close for b in bars]
+    rsi_s = _rsi_series(closes, length)
+    n = len(bars)
+    # Recent window (last `recent_window` bars) vs prior window (everything
+    # before that, capped at xbars total lookback).
+    start = max(0, n - xbars)
+    prior_end = n - recent_window
+    if prior_end - start < recent_window:
+        return None
+    recent_closes = closes[prior_end:n]
+    prior_closes = closes[start:prior_end]
+    recent_rsi = [r for r in rsi_s[prior_end:n] if r is not None]
+    prior_rsi = [r for r in rsi_s[start:prior_end] if r is not None]
+    if not recent_rsi or not prior_rsi:
+        return None
+    rch, pch = max(recent_closes), max(prior_closes)
+    rcl, pcl = min(recent_closes), min(prior_closes)
+    rrh, prh = max(recent_rsi), max(prior_rsi)
+    rrl, prl = min(recent_rsi), min(prior_rsi)
+    # Bearish divergence
+    if rch > pch and rrh < prh:
+        return "BEAR_DIV"
+    # Bullish divergence
+    if rcl < pcl and rrl > prl:
+        return "BULL_DIV"
     return None
 
 # ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
@@ -1730,6 +1801,15 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         elif ttr_near == "BULLISH_NEAR":
             flags.append("TTR_NEAR_BUY")
 
+    # v2.6 — Libertus RSI Divergence (Pine v4 port). Classic momentum-vs-price
+    # divergence on 14-period RSI / 90-bar lookback. EV=0 informational until
+    # backtest cycle calibrates.
+    rsi_div = libertus_rsi_div_signal(bars, length=14, xbars=90)
+    if rsi_div == "BEAR_DIV":
+        flags.append("RSI_DIV_BEAR")
+    elif rsi_div == "BULL_DIV":
+        flags.append("RSI_DIV_BULL")
+
     # v1.8.2.1 dropped vs v1.8.2:
     #   TREND_QUALITY    — fired on 47% of all bars, pure noise
     #   MULTI_CONFLUENCE_5 — -3.6pp bull WR vs baseline
@@ -2084,7 +2164,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.5.2 (6-engine + Ceyhun_OBOB + TTR + always-on PSAR distance) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.6 (6-engine + Ceyhun_OBOB + TTR + Libertus_RSI_Div) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
