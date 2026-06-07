@@ -732,6 +732,38 @@ def ttr_signal(bars, start=0.02, increment=0.02, max_af=0.025):
         return "SELL"
     return None
 
+def ttr_near_flip(bars, threshold_pct=1.0, start=0.02, increment=0.02, max_af=0.025):
+    """v2.5.1: setup detector — fires when PSAR is within `threshold_pct` of
+    today's close, signaling a likely TTR crossover on the next bar.
+
+    Returns:
+      'BULLISH_NEAR' — PSAR is above price but within threshold (close to flipping
+                       BULLISH, i.e. price about to break above PSAR → TTR_BUY)
+      'BEARISH_NEAR' — PSAR is below price but within threshold (close to flipping
+                       BEARISH, i.e. price about to break below PSAR → TTR_SELL)
+      None            — PSAR is far from price OR currently at the flip
+                        (use ttr_signal for the actual crossover bar).
+    """
+    if len(bars) < 5:
+        return None
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    psar = _psar(highs, lows, start=start, increment=increment, max_af=max_af)
+    if psar[-1] is None:
+        return None
+    p = psar[-1]
+    c = bars[-1].close
+    if c <= 0:
+        return None
+    distance_pct = abs(p - c) / c * 100.0
+    if distance_pct > threshold_pct:
+        return None
+    if p > c:
+        return "BULLISH_NEAR"   # price below PSAR, about to break above
+    if p < c:
+        return "BEARISH_NEAR"   # price above PSAR, about to break below
+    return None
+
 # ── v1.9 fundamentals (earnings calendar + Beneish M-Score) ────────────────
 
 _FUND_CACHE_PATH = "/data/.openclaw/workspace/memory/femisagent_fundamentals.cache.json"
@@ -1685,6 +1717,16 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
         flags.append("TTR_BUY")
     elif ttr == "SELL":
         flags.append("TTR_SELL")
+    else:
+        # v2.5.1: TTR_NEAR_FLIP — PSAR within 1% of price = flip likely on
+        # next bar. Way more actionable than waiting for the actual crossover
+        # on a low-frequency signal. Direction inferred from PSAR position
+        # relative to price.
+        ttr_near = ttr_near_flip(bars, threshold_pct=1.0)
+        if ttr_near == "BEARISH_NEAR":
+            flags.append("TTR_NEAR_SELL")
+        elif ttr_near == "BULLISH_NEAR":
+            flags.append("TTR_NEAR_BUY")
 
     # v1.8.2.1 dropped vs v1.8.2:
     #   TREND_QUALITY    — fired on 47% of all bars, pure noise
@@ -2020,7 +2062,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.5 (femisapien + TAF + sentiment + price-decomp + Ceyhun_OBOB + TTR) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.5.1 (6-engine + Ceyhun_OBOB + TTR + TTR_NEAR_FLIP) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
