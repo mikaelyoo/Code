@@ -51,11 +51,21 @@ from datetime import date, datetime, timedelta, timezone
 from femisagent import compute_flags
 
 DEFAULT_WATCHLIST = [
+    # Core AI-semis universe (calibration baseline 2024-2026)
     "TSLA","RKLB","ASTS","MSFT","NVDA","AMD","MU","AMZN","GOOGL","META",
     "ARM","SNPS","KLAC","AMAT","LRCX","TSM","AVGO","MRVL","CRDO","ALAB",
     "FN","AMKR","COHR","AAOI","HOOD","POWL","NBIS","TMUS","ADI","TXN",
     "QCOM","ASML","LITE","SMTC","HIMS","MP","JBL","IBIT","IREN","GEV",
-    "BE","CLS","CRWV","VST","NEE","RIOT","CORZ","HUT","GDX"
+    "BE","CLS","CRWV","VST","NEE","RIOT","CORZ","HUT","GDX",
+    # Expanded 2026-06-07: union with live watchlist + portfolio holds.
+    # Brings calibration universe in line with what femisagent actually
+    # scans today (71 unique tradeable tickers). Excludes SNDK (Feb-2025
+    # spin-off with truncated history that hangs yfinance) and crypto/
+    # futures pseudo-tickers (BTC/ETH/NQ/ES) that don't resolve.
+    "POET","PL","SATS","DXYZ","INTC","AEHR","VPG","CRCL","CVX","XLU",
+    "CEG","PWR","MPWR","FCX","GLW","WDC","DELL","HPE","ON",
+    # Index/sector ETFs held in book
+    "QQQ","QQQM","SMH",
 ]
 
 
@@ -353,8 +363,9 @@ def main():
             if not args.no_wilson else "off"
         )
         args.version_tag = (
-            f"FEMISAPIEN Auto-Backtest — yfinance "
+            f"FEMISAPIEN Auto-Backtest v2 — yfinance "
             f"{args.start}→{args.end} h{args.horizon}td "
+            f"u={len(args.tickers)} "
             f"(Wilson: {wilson_desc})"
         )
 
