@@ -1,0 +1,15 @@
+# /etc/systemd/system/femisagent_outcome_resolver.service
+# Nightly Tier 4 job: fill in forward returns for past signal snapshots.
+[Unit]
+Description=femisagent outcome resolver (forward returns for signal cohorts)
+After=jarvis-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisagent_outcome_resolver.py
+User=root
+TimeoutStartSec=1200
+EnvironmentFile=-/etc/default/jarvis-bridge
+
+[Install]
+WantedBy=multi-user.target

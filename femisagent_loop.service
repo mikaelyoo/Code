@@ -1,0 +1,16 @@
+# /etc/systemd/system/femisagent_loop.service
+# Continuous femisagent scan + alert dispatcher. Fired by femisagent_loop.timer.
+[Unit]
+Description=femisagent continuous scan + alert dispatcher
+After=jarvis-bridge.service
+Wants=jarvis-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisagent_loop.sh
+User=root
+TimeoutStartSec=1500
+# Inherit jarvis-bridge env at runtime via the script itself (systemctl show)
+
+[Install]
+WantedBy=multi-user.target
