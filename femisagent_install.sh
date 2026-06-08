@@ -24,7 +24,8 @@ for f in femisagent.py femisagent_backtest.py femisa_sync.sh \
          femisagent_alert.py femisagent_loop.sh \
          femisagent_outcome_logger.py femisagent_outcome_resolver.py \
          femisagent_chat.py \
-         femisagent_rebalance.py risk_policy.yml.example; do
+         femisagent_rebalance.py risk_policy.yml.example \
+         femisagent_mcp.py; do
   log "Pulling $f"
   if curl -fsSL --max-time 30 -o "/tmp/__inst_$f" "${REPO_RAW}/${f}"; then
     if [[ "$f" == *.py ]]; then
@@ -42,7 +43,8 @@ done
 mkdir -p /var/lib/femisagent /var/log/femisagent /etc/femisagent
 for u in femisagent_loop.service femisagent_loop.timer \
          femisagent_chat.service \
-         femisagent_outcome_resolver.service femisagent_outcome_resolver.timer; do
+         femisagent_outcome_resolver.service femisagent_outcome_resolver.timer \
+         femisagent_mcp.service; do
   log "Installing $u"
   curl -fsSL --max-time 30 -o "${SYSTEMD_DIR}/${u}" "${REPO_RAW}/${u}"
 done
@@ -56,19 +58,29 @@ fi
 # 4. Reload + enable + start
 systemctl daemon-reload
 
-# Don't auto-start chat bot unless OPENROUTER_API_KEY is configured
+# Install MCP server deps (idempotent; uses --upgrade-strategy only-if-needed)
+log "Installing MCP server deps (mcp, starlette, uvicorn)"
+pip install --quiet --break-system-packages mcp starlette uvicorn 2>&1 | tail -5 || \
+  log "⚠️  pip install failed — install manually: pip install mcp starlette uvicorn"
+
+# Enable MCP server (HTTP mode) — listens on localhost:8766 by default.
+# Expose externally with nginx/caddy reverse proxy + TLS for claude.ai connector.
+log "Enabling MCP server (HTTP, port 8766)"
+systemctl enable --now femisagent_mcp.service
+sleep 2
+if systemctl is-active --quiet femisagent_mcp.service; then
+  log "MCP server active: http://localhost:8766/mcp"
+else
+  log "⚠️  femisagent_mcp.service failed to start — check: journalctl -u femisagent_mcp -n 30"
+fi
+
+# Telegram chat bot is now optional (MCP replaces conversational layer).
+# Only enable if explicitly configured.
 if [ -f /etc/femisagent/chat.env ] && grep -q OPENROUTER_API_KEY /etc/femisagent/chat.env; then
-  log "Enabling chat bot (OPENROUTER_API_KEY configured)"
+  log "Enabling Telegram chat bot (legacy — MCP is preferred)"
   systemctl enable --now femisagent_chat.service
 else
-  log "⚠️  /etc/femisagent/chat.env missing or no OPENROUTER_API_KEY — chat bot NOT enabled"
-  log "    To enable, create /etc/femisagent/chat.env with:"
-  log "      OPENROUTER_API_KEY=sk-or-v1-..."
-  log "      LLM_MODEL=deepseek/deepseek-chat-v4-pro"
-  log "      TELEGRAM_BOT_TOKEN=..."
-  log "      TELEGRAM_CHAT_ID=..."
-  log "      SUPABASE_URL=...  SUPABASE_KEY=..."
-  log "    Then: systemctl enable --now femisagent_chat.service"
+  log "(Telegram chat bot not enabled — MCP server is now the primary chat interface)"
 fi
 
 log "Enabling continuous scan timer"

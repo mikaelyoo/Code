@@ -147,11 +147,39 @@ def diff_runs(current, previous):
     return alerts
 
 
+def send_email(subject, body):
+    """Send via SMTP. Env: ALERT_EMAIL_TO, SMTP_HOST, SMTP_PORT (587),
+    SMTP_USER, SMTP_PASS, ALERT_EMAIL_FROM (defaults to SMTP_USER).
+    Returns True if sent."""
+    to_addr = os.environ.get("ALERT_EMAIL_TO")
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+    if not all((to_addr, smtp_host, smtp_user, smtp_pass)):
+        return False
+    from_addr = os.environ.get("ALERT_EMAIL_FROM", smtp_user)
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = from_addr
+        msg["To"] = to_addr
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        log.error(f"Email send failed: {e}")
+        return False
+
+
 def send_telegram(message):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not (bot_token and chat_id):
-        log.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set; skipping Telegram send")
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = urllib.parse.urlencode({
@@ -227,20 +255,32 @@ def main():
     high = [a for a in alerts if a["severity"] == "HIGH"]
     medium = [a for a in alerts if a["severity"] == "MEDIUM"]
 
+    def dispatch(subject, body, alerts_in_batch):
+        """Send via whichever channels are configured. Returns True if any
+        channel succeeded."""
+        sent_any = False
+        # Telegram (if TELEGRAM_BOT_TOKEN configured)
+        if send_telegram(body):
+            sent_any = True
+        # Email (if SMTP_HOST + ALERT_EMAIL_TO configured)
+        # Strip markdown asterisks for plain-text email
+        plain = body.replace("*", "")
+        if send_email(subject, plain):
+            sent_any = True
+        for a in alerts_in_batch:
+            log_to_supabase(a, sent_any)
+        return sent_any
+
     sent_count = 0
     if high:
         body = "*🚨 femisagent HIGH-PRIORITY ALERTS*\n\n" + "\n\n".join(a["message"] for a in high)
-        if send_telegram(body):
+        if dispatch("[femisagent HIGH] " + ", ".join(a["ticker"] for a in high[:4]), body, high):
             sent_count += len(high)
-        for a in high:
-            log_to_supabase(a, True)
 
     if medium:
         body = "*📈 femisagent signal updates*\n\n" + "\n\n".join(a["message"] for a in medium)
-        if send_telegram(body):
+        if dispatch("[femisagent] " + ", ".join(a["ticker"] for a in medium[:4]), body, medium):
             sent_count += len(medium)
-        for a in medium:
-            log_to_supabase(a, True)
 
     log.info(f"Sent {sent_count} alerts ({len(high)} HIGH, {len(medium)} MEDIUM)")
     save_json(PREV_RUN_PATH, current)

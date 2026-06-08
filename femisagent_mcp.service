@@ -1,0 +1,23 @@
+# /etc/systemd/system/femisagent_mcp.service
+# Long-running MCP server for claude.ai remote-connector access.
+# Exposes femisagent tools (run_scan, query_portfolio, propose_rebalance, etc).
+# Stdio mode is used by Claude Desktop and doesn't need this service —
+# this is only for HTTP/remote mode.
+[Unit]
+Description=femisagent MCP server (HTTP mode for claude.ai remote)
+After=network-online.target jarvis-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisagent_mcp.py --http --port 8766
+Restart=on-failure
+RestartSec=30
+User=root
+StandardOutput=append:/var/log/femisagent/mcp.log
+StandardError=append:/var/log/femisagent/mcp.log
+EnvironmentFile=-/etc/default/jarvis-bridge
+EnvironmentFile=-/etc/femisagent/mcp.env
+
+[Install]
+WantedBy=multi-user.target
