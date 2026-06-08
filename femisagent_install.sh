@@ -58,10 +58,17 @@ fi
 # 4. Reload + enable + start
 systemctl daemon-reload
 
-# Install MCP server deps (idempotent; uses --upgrade-strategy only-if-needed)
-log "Installing MCP server deps (mcp, starlette, uvicorn)"
-pip install --quiet --break-system-packages mcp starlette uvicorn 2>&1 | tail -5 || \
-  log "⚠️  pip install failed — install manually: pip install mcp starlette uvicorn"
+# Install MCP server deps in a dedicated venv (avoids Ubuntu 24.04 PEP 668
+# conflicts with system typing_extensions etc.)
+VENV_DIR="/opt/femisagent-venv"
+if [ ! -d "$VENV_DIR" ]; then
+  log "Creating MCP venv at $VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+fi
+log "Installing MCP server deps into venv"
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+"$VENV_DIR/bin/pip" install --quiet mcp starlette uvicorn 2>&1 | tail -5 || \
+  log "⚠️  pip install in venv failed — check $VENV_DIR/bin/pip install mcp"
 
 # Enable MCP server (HTTP mode) — listens on localhost:8766 by default.
 # Expose externally with nginx/caddy reverse proxy + TLS for claude.ai connector.
