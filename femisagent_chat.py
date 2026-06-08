@@ -17,9 +17,11 @@ Long-running Telegram bot. Polls for incoming messages. For each user message:
 Env vars:
   TELEGRAM_BOT_TOKEN          (required)
   TELEGRAM_CHAT_ID            (restrict to one chat; if absent, allows any)
-  ANTHROPIC_API_KEY           (required — uses Claude API)
+  OPENROUTER_API_KEY          (required — uses OpenRouter unified gateway)
   SUPABASE_URL, SUPABASE_KEY  (for chat history + signal outcomes)
-  CLAUDE_MODEL                (optional — defaults to claude-sonnet-4-6)
+  LLM_MODEL                   (optional — defaults to deepseek/deepseek-chat-v4-pro)
+  OPENROUTER_REFERER          (optional — attribution header)
+  OPENROUTER_TITLE            (optional — app name shown in OpenRouter dashboard)
 
 Run as systemd long-running daemon:
   ExecStart=/usr/bin/python3 /scripts/femisagent_chat.py
@@ -37,6 +39,8 @@ import time
 import logging
 import subprocess
 import urllib.request
+import urllib.error
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -45,7 +49,8 @@ log = logging.getLogger("femisa_chat")
 
 SCRIPTS_DIR = Path("/docker/openclaw-vhii/data/.openclaw/workspace/scripts")
 LAST_RUN_PATH = Path("/data/.openclaw/workspace/memory/femisagent_last_run.json")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat-v4-pro")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 POLL_INTERVAL = 3
 
 SYSTEM_PROMPT = """You are femisagent, an autonomous trading-analysis assistant for a portfolio
@@ -284,67 +289,113 @@ TOOL_IMPL = {
     "propose_rebalance": tool_propose_rebalance,
 }
 
-# ─── Claude API ────────────────────────────────────────────────────────────
+# ─── OpenRouter API (OpenAI-compatible chat completions) ───────────────────
 
-def claude_call(messages):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+def _tools_to_openai_schema():
+    """Convert Anthropic-style TOOLS to OpenAI function-calling format."""
+    out = []
+    for t in TOOLS:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        })
+    return out
+
+
+def llm_call(messages):
+    """Call OpenRouter (OpenAI chat-completions compatible).
+    `messages` is OpenAI-format: list of {role, content} where role ∈
+    {system, user, assistant, tool} and assistant turns may include
+    `tool_calls` array."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        return {"error": "ANTHROPIC_API_KEY not set"}
+        return {"error": "OPENROUTER_API_KEY not set"}
     payload = {
         "model": MODEL,
-        "max_tokens": 1500,
-        "system": SYSTEM_PROMPT,
         "messages": messages,
-        "tools": TOOLS,
+        "tools": _tools_to_openai_schema(),
+        "tool_choice": "auto",
+        "max_tokens": 2000,
+        "temperature": 0.2,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "https://femisagent.local"),
+        "X-Title": os.environ.get("OPENROUTER_TITLE", "femisagent"),
     }
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        OPENROUTER_URL,
         data=json.dumps(payload).encode(),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:1000]
+        log.error(f"OpenRouter HTTP {e.code}: {body}")
+        return {"error": f"HTTP {e.code}: {body[:400]}"}
     except Exception as e:
-        log.error(f"Claude API error: {e}")
+        log.error(f"OpenRouter call failed: {e}")
         return {"error": str(e)}
 
 
 def run_agent_loop(user_message, session_id):
-    """Multi-turn loop: call Claude → if tool_use, run tool, feed back → repeat
-    until Claude returns text (end_turn). Logs every turn to Supabase."""
-    messages = [{"role": "user", "content": user_message}]
+    """Multi-turn agent loop in OpenAI/OpenRouter format.
+
+    OpenAI message shapes:
+      {role:"system", content: SYSTEM_PROMPT}
+      {role:"user", content: "..."}
+      {role:"assistant", content: "..."|null, tool_calls: [{id, type:"function",
+                                                            function:{name, arguments}}]}
+      {role:"tool", tool_call_id: "...", content: "..."}
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
     log_chat(session_id, "user", user_message)
 
     for hop in range(8):  # safety cap
-        resp = claude_call(messages)
+        resp = llm_call(messages)
         if "error" in resp:
             return f"⚠️ Error: {resp['error']}"
 
-        # Append assistant turn to conversation
-        messages.append({"role": "assistant", "content": resp["content"]})
+        choices = resp.get("choices") or []
+        if not choices:
+            return f"⚠️ Empty response from model: {json.dumps(resp)[:400]}"
+        msg = choices[0].get("message", {}) or {}
 
-        # Check for tool calls
-        tool_uses = [b for b in resp["content"] if b["type"] == "tool_use"]
-        if not tool_uses:
-            # Text-only response — extract and return
-            text_blocks = [b["text"] for b in resp["content"] if b["type"] == "text"]
-            reply = "\n".join(text_blocks).strip()
+        # Append assistant turn (preserve full shape for next-hop context)
+        assistant_turn = {"role": "assistant", "content": msg.get("content")}
+        if msg.get("tool_calls"):
+            assistant_turn["tool_calls"] = msg["tool_calls"]
+        messages.append(assistant_turn)
+
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            reply = (msg.get("content") or "").strip() or "(empty reply)"
+            usage = resp.get("usage", {})
             log_chat(session_id, "assistant", reply,
-                     tokens_in=resp.get("usage", {}).get("input_tokens"),
-                     tokens_out=resp.get("usage", {}).get("output_tokens"))
+                     tokens_in=usage.get("prompt_tokens"),
+                     tokens_out=usage.get("completion_tokens"))
             return reply
 
-        # Execute tool calls, send results back
-        tool_results = []
-        for tu in tool_uses:
-            tool_name = tu["name"]
-            tool_input = tu["input"]
+        # Execute each tool call, feed back as role="tool" messages
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            tool_name = fn.get("name")
+            raw_args = fn.get("arguments", "{}")
+            try:
+                tool_input = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except json.JSONDecodeError:
+                tool_input = {}
             log.info(f"Tool call: {tool_name}({tool_input})")
             impl = TOOL_IMPL.get(tool_name)
             if not impl:
@@ -356,12 +407,11 @@ def run_agent_loop(user_message, session_id):
                     result = {"error": f"{type(e).__name__}: {e}"}
             log_chat(session_id, "tool", json.dumps(result)[:1000],
                      tool_name=tool_name, tool_input=tool_input, tool_output=result)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tu["id"],
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
                 "content": json.dumps(result)[:8000],
             })
-        messages.append({"role": "user", "content": tool_results})
 
     return "⚠️ Reached max tool-use hops without conclusion."
 
@@ -416,7 +466,6 @@ def telegram_get_updates(offset):
 def telegram_send(chat_id, text):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    import urllib.parse
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
         "text": text[:4000],
@@ -432,8 +481,8 @@ def main():
     if not os.environ.get("TELEGRAM_BOT_TOKEN"):
         log.error("TELEGRAM_BOT_TOKEN missing")
         return 1
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.error("ANTHROPIC_API_KEY missing")
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        log.error("OPENROUTER_API_KEY missing")
         return 1
 
     allowed_chat = os.environ.get("TELEGRAM_CHAT_ID")

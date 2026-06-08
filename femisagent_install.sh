@@ -56,13 +56,18 @@ fi
 # 4. Reload + enable + start
 systemctl daemon-reload
 
-# Don't auto-start chat bot unless ANTHROPIC_API_KEY is configured
-if [ -f /etc/femisagent/chat.env ] && grep -q ANTHROPIC_API_KEY /etc/femisagent/chat.env; then
-  log "Enabling chat bot (ANTHROPIC_API_KEY configured)"
+# Don't auto-start chat bot unless OPENROUTER_API_KEY is configured
+if [ -f /etc/femisagent/chat.env ] && grep -q OPENROUTER_API_KEY /etc/femisagent/chat.env; then
+  log "Enabling chat bot (OPENROUTER_API_KEY configured)"
   systemctl enable --now femisagent_chat.service
 else
-  log "⚠️  /etc/femisagent/chat.env missing or no ANTHROPIC_API_KEY — chat bot NOT enabled"
-  log "    To enable: echo 'ANTHROPIC_API_KEY=sk-ant-...' > /etc/femisagent/chat.env"
+  log "⚠️  /etc/femisagent/chat.env missing or no OPENROUTER_API_KEY — chat bot NOT enabled"
+  log "    To enable, create /etc/femisagent/chat.env with:"
+  log "      OPENROUTER_API_KEY=sk-or-v1-..."
+  log "      LLM_MODEL=deepseek/deepseek-chat-v4-pro"
+  log "      TELEGRAM_BOT_TOKEN=..."
+  log "      TELEGRAM_CHAT_ID=..."
+  log "      SUPABASE_URL=...  SUPABASE_KEY=..."
   log "    Then: systemctl enable --now femisagent_chat.service"
 fi
 
