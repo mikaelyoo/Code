@@ -23,7 +23,8 @@ log "════ femisagent agent stack install ════"
 for f in femisagent.py femisagent_backtest.py femisa_sync.sh \
          femisagent_alert.py femisagent_loop.sh \
          femisagent_outcome_logger.py femisagent_outcome_resolver.py \
-         femisagent_chat.py; do
+         femisagent_chat.py \
+         femisagent_rebalance.py risk_policy.yml.example; do
   log "Pulling $f"
   if curl -fsSL --max-time 30 -o "/tmp/__inst_$f" "${REPO_RAW}/${f}"; then
     if [[ "$f" == *.py ]]; then
@@ -46,7 +47,13 @@ for u in femisagent_loop.service femisagent_loop.timer \
   curl -fsSL --max-time 30 -o "${SYSTEMD_DIR}/${u}" "${REPO_RAW}/${u}"
 done
 
-# 3. Reload + enable + start
+# 3. Seed risk policy template if /etc/femisagent/risk_policy.yml not present
+if [ ! -f /etc/femisagent/risk_policy.yml ] && [ -f "${SCRIPTS_DIR}/risk_policy.yml.example" ]; then
+  cp "${SCRIPTS_DIR}/risk_policy.yml.example" /etc/femisagent/risk_policy.yml
+  log "Seeded /etc/femisagent/risk_policy.yml from example (EDIT THE NAV ESTIMATE)"
+fi
+
+# 4. Reload + enable + start
 systemctl daemon-reload
 
 # Don't auto-start chat bot unless ANTHROPIC_API_KEY is configured

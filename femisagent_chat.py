@@ -192,6 +192,29 @@ def tool_query_calibration():
     return {"calibrations": rows}
 
 
+def tool_propose_rebalance(commit=False, nav=None, max_orders=None):
+    """Tier 2 — run femisagent_rebalance.py against latest scan + portfolio +
+    risk policy. Returns proposed orders + markdown memo. If commit=True,
+    persists CSV + memo to /var/lib/femisagent/proposals/."""
+    cmd = ["python3", str(SCRIPTS_DIR / "femisagent_rebalance.py")]
+    if commit:
+        cmd.append("--commit")
+    if nav:
+        cmd.extend(["--nav", str(nav)])
+    if max_orders:
+        cmd.extend(["--max", str(max_orders)])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=str(SCRIPTS_DIR))
+        return {
+            "exit_code": r.returncode,
+            "output": r.stdout[-6000:],
+            "stderr": r.stderr[-500:] if r.stderr else None,
+            "committed": commit,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "rebalance timed out"}
+
+
 TOOLS = [
     {
         "name": "run_scan",
@@ -235,6 +258,21 @@ TOOLS = [
         "description": "Latest backtest calibration metadata (Wilson-CI flag stats live in this row's flag_stats JSON).",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "propose_rebalance",
+        "description": "Tier 2: build a rebalance proposal from latest scan + portfolio + risk policy. Returns BasketTrader-compatible CSV orders + decision memo. Use when user asks 'what should I trade?', 'build me orders', 'rebalance my book', etc. Default returns proposal WITHOUT writing to disk (commit=false). Set commit=true to save to /var/lib/femisagent/proposals/ for actual execution.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commit": {"type": "boolean", "default": False,
+                           "description": "If true, persist CSV+memo to disk. If false, just return the proposal."},
+                "nav": {"type": "number",
+                        "description": "Override NAV estimate in USD (default: from risk policy)."},
+                "max_orders": {"type": "integer",
+                               "description": "Cap proposed order count (default: 30)."},
+            },
+        },
+    },
 ]
 
 TOOL_IMPL = {
@@ -243,6 +281,7 @@ TOOL_IMPL = {
     "query_signal_history": tool_query_signal_history,
     "query_outcomes_by_flag": tool_query_outcomes_by_flag,
     "query_calibration": tool_query_calibration,
+    "propose_rebalance": tool_propose_rebalance,
 }
 
 # ─── Claude API ────────────────────────────────────────────────────────────
