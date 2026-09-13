@@ -339,6 +339,7 @@ LIVE_BLEND_ENABLED = os.environ.get("FEMISA_LIVE_BLEND", "1") == "1"
 LIVE_BLEND_DAYS    = int(os.environ.get("FEMISA_LIVE_DAYS", "90"))
 LIVE_BLEND_MIN_N   = int(os.environ.get("FEMISA_LIVE_MIN_N", "30"))
 LIVE_BLEND_K       = float(os.environ.get("FEMISA_LIVE_K", "60"))
+LIVE_BLEND_MIN_ABS = float(os.environ.get("FEMISA_LIVE_MIN_ABS", "1.0"))
 
 # Momentum-continuation primaries that live outcomes showed at 7–20% WR when
 # SPY's 20d return was negative. Capped at WATCH in that regime (gate 3b).
@@ -378,11 +379,19 @@ def _blend_live_calibration():
     n_adj = 0
     for lr in rows:
         flag = lr["flag"]
-        if (lr.get("n60") and int(lr["n60"]) >= LIVE_BLEND_MIN_N
+        # The 60d live sample is thin and autocorrelated early on (it only
+        # covers entries ≥60 scan-days old), so require twice the 20d minimum
+        # before preferring it over the 20d horizon.
+        if (lr.get("n60") and int(lr["n60"]) >= 2 * LIVE_BLEND_MIN_N
                 and lr.get("excess_60d") is not None):
             n, live_x, hz = int(lr["n60"]), float(lr["excess_60d"]), "60d"
         else:
             n, live_x, hz = int(lr["n20"]), float(lr["excess_20d"]), "20d"
+        # Dead-zone: flags the backtest never calibrated (context/gate flags
+        # like HGDCF_PFP fire on ~90% of rows) only enter if live evidence is
+        # material; otherwise they stay at EV 0 as before.
+        if flag not in FLAG_STATS and abs(live_x) < LIVE_BLEND_MIN_ABS:
+            continue
         w = n / (n + LIVE_BLEND_K)
         s = FLAG_STATS.setdefault(flag, {"win_rate": 0.5, "avg_ret": 0.0,
                                          "priority": 999, "n": 0})
@@ -2405,7 +2414,9 @@ async def run(tickers=None, portfolio_mode=False):
         # Live outcomes showed the worst cohort was "momentum primary +
         # bearish co-fires" (e.g. HRT_STRONG_v4 + RSI_DIV_BEAR). The strongest
         # bearish co-fire now drags EV by half its (blended) excess.
-        _neg_evs = [ev_score(f) for f in all_flags if ev_score(f) < 0]
+        # Only co-fires (not the primary itself) can penalise, so a ticker whose
+        # sole flag is bearish is scored once, not twice.
+        _neg_evs = [ev_score(f) for f in all_flags if f != primary and ev_score(f) < 0]
         _ev = round(ev_score(primary) + (0.5 * min(_neg_evs) if _neg_evs else 0.0), 1)
 
         row = {
