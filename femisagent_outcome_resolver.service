@@ -1,15 +1,22 @@
 # /etc/systemd/system/femisagent_outcome_resolver.service
-# Nightly Tier 4 job: fill in forward returns for past signal snapshots.
+# Nightly Tier-4 job: fill forward returns on femisagent_signal_outcomes via
+# the in-database RPC femisagent_resolve_outcomes() (no yfinance).
+#
+# v2: reads creds from /etc/femisagent/mcp.env. The v1 unit pointed at
+# /etc/default/jarvis-bridge, which does not exist, so the job ran with no
+# SUPABASE_* env and failed every night for three months. The script also
+# self-loads mcp.env as a fallback, so this line is belt-and-braces.
 [Unit]
-Description=femisagent outcome resolver (forward returns for signal cohorts)
-After=jarvis-bridge.service
+Description=femisagent outcome resolver (forward returns via in-DB RPC)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 /docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisagent_outcome_resolver.py
 User=root
-TimeoutStartSec=1200
-EnvironmentFile=-/etc/default/jarvis-bridge
+TimeoutStartSec=600
+EnvironmentFile=-/etc/femisagent/mcp.env
 
 [Install]
 WantedBy=multi-user.target

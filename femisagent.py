@@ -297,6 +297,7 @@ def load_latest_calibration():
                         f"run id={row['id']} | {row['version']} | "
                         f"WR={row['weighted_win_rate']} | AvgRet={row['weighted_avg_return_pct']}%"
                     )
+                    _blend_live_calibration()
                     return
         except Exception as e:
             print(f"[femisagent] Supabase fetch failed ({e}); trying cache…")
@@ -313,11 +314,100 @@ def load_latest_calibration():
             f"run id={cached.get('run_id')} | {cached.get('version')} | "
             f"cached_at={cached.get('cached_at')}"
         )
+        _blend_live_calibration()
         return
     except Exception:
         pass
 
     print(f"[femisagent] Using hardcoded v3.8 FLAG_STATS (no Supabase, no cache)")
+
+
+# ── v2.9: live-outcome blending (closes the Tier-4 loop) ───────────────────
+# The backtest calibration is a 5-year, mostly-bull-market average. Realized
+# outcomes logged to femisagent_signal_outcomes (Jun–Sep 2026, a drawdown
+# regime) showed momentum flags (PARABOLIC_*, HRT_STRONG_v4, MOMENTUM_SURGE,
+# 20D_BREAKOUT, VPIN_THRUST) running 11–18pp BELOW baseline at t+20d while
+# contrarian flags (HRT_WEAK, GS_DISTRIB, VPIN_TOXIC) ran 7–11pp ABOVE it.
+# Scoring off the static backtest alone put the momentum names in BUY, which
+# was the worst-performing tier live (−5.1% t+20d vs WATCH −3.8%).
+# Fix: shrink each flag's backtest excess toward its trailing live excess with
+# weight w = n/(n+K). A flag with ~K live ticker-days is half live / half
+# backtest; thin flags stay on backtest. Everything downstream (ev_score,
+# _edge, tiers) reads FLAG_STATS[flag]["excess_ret"], so this one hook
+# regime-adjusts the whole system.
+LIVE_BLEND_ENABLED = os.environ.get("FEMISA_LIVE_BLEND", "1") == "1"
+LIVE_BLEND_DAYS    = int(os.environ.get("FEMISA_LIVE_DAYS", "90"))
+LIVE_BLEND_MIN_N   = int(os.environ.get("FEMISA_LIVE_MIN_N", "30"))
+LIVE_BLEND_K       = float(os.environ.get("FEMISA_LIVE_K", "60"))
+
+# Momentum-continuation primaries that live outcomes showed at 7–20% WR when
+# SPY's 20d return was negative. Capped at WATCH in that regime (gate 3b).
+_BEAR_REGIME_MOMENTUM = frozenset({
+    "PARABOLIC_BLOCK", "PARABOLIC_TRENDED", "PARABOLIC_RECOVERY",
+    "MOMENTUM_SURGE", "MOMENTUM_CONTINUATION", "20D_BREAKOUT",
+    "HRT_STRONG_v4", "HRT_STRONG", "VPIN_THRUST", "GS_MILD_ACCUM", "OBV_THRUST",
+})
+
+
+def _blend_live_calibration():
+    """Pull trailing realized per-flag excess (RPC femisagent_live_flag_stats)
+    and blend it into FLAG_STATS[*]["excess_ret"]. Prefers the 60d horizon
+    (matches the backtest's h60td) once it has LIVE_BLEND_MIN_N observations,
+    else uses 20d. Silently no-ops if Supabase or the RPC is unavailable."""
+    global CALIBRATION_SOURCE
+    if not (LIVE_BLEND_ENABLED and SUPABASE_KEY):
+        return
+    try:
+        req = _urllib_req.Request(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/rpc/femisagent_live_flag_stats",
+            data=json.dumps({"lookback_days": LIVE_BLEND_DAYS,
+                             "min_n": LIVE_BLEND_MIN_N}).encode(),
+            headers={"apikey": SUPABASE_KEY,
+                     "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            method="POST")
+        with _urllib_req.urlopen(req, timeout=15) as r:
+            rows = json.loads(r.read())
+    except Exception as e:
+        print(f"[femisagent] live-blend skipped ({e})")
+        return
+    if not rows:
+        print("[femisagent] live-blend: no resolved outcomes in window yet")
+        return
+    n_adj = 0
+    for lr in rows:
+        flag = lr["flag"]
+        if (lr.get("n60") and int(lr["n60"]) >= LIVE_BLEND_MIN_N
+                and lr.get("excess_60d") is not None):
+            n, live_x, hz = int(lr["n60"]), float(lr["excess_60d"]), "60d"
+        else:
+            n, live_x, hz = int(lr["n20"]), float(lr["excess_20d"]), "20d"
+        w = n / (n + LIVE_BLEND_K)
+        s = FLAG_STATS.setdefault(flag, {"win_rate": 0.5, "avg_ret": 0.0,
+                                         "priority": 999, "n": 0})
+        bt_x = (float(s["excess_ret"]) if "excess_ret" in s
+                else s.get("win_rate", 0) * s.get("avg_ret", 0))
+        s.update({
+            "bt_excess_ret":   round(bt_x, 2),
+            "live_excess_ret": live_x,
+            "live_n":          n,
+            "live_horizon":    hz,
+            "live_w":          round(w, 2),
+            "excess_ret":      round((1 - w) * bt_x + w * live_x, 2),
+        })
+        n_adj += 1
+    CALIBRATION_SOURCE = f"{CALIBRATION_SOURCE}+live{LIVE_BLEND_DAYS}d"
+    print(f"[femisagent] Live-blend: {n_adj} flags adjusted from trailing "
+          f"{LIVE_BLEND_DAYS}d realized outcomes "
+          f"(live 20d baseline {rows[0].get('baseline_20d')}%, K={LIVE_BLEND_K:g})")
+
+
+def verdict_from_ev(ev):
+    if ev >= 4:  return "🟢 EXECUTE"
+    if ev >= 2:  return "🟢 BUY"
+    if ev >= 0:  return "🟡 WATCH"
+    return "🔴 AVOID"
 
 
 def ev_score(flag):
@@ -2310,6 +2400,14 @@ async def run(tickers=None, portfolio_mode=False):
             _ttr_dist_pct = None
             _ttr_position = None
 
+        # v2.9: net-of-negatives EV. Previously EV was the primary flag's
+        # excess alone, so bearish co-fires never reduced a ticker's score.
+        # Live outcomes showed the worst cohort was "momentum primary +
+        # bearish co-fires" (e.g. HRT_STRONG_v4 + RSI_DIV_BEAR). The strongest
+        # bearish co-fire now drags EV by half its (blended) excess.
+        _neg_evs = [ev_score(f) for f in all_flags if ev_score(f) < 0]
+        _ev = round(ev_score(primary) + (0.5 * min(_neg_evs) if _neg_evs else 0.0), 1)
+
         row = {
             "symbol":     sym,
             "price":      round(c, 2),
@@ -2321,8 +2419,9 @@ async def run(tickers=None, portfolio_mode=False):
             "ttr_psar":   round(_psar_now, 2) if _psar_now is not None else None,
             "ttr_dist_pct": round(_ttr_dist_pct, 2) if _ttr_dist_pct is not None else None,
             "ttr_position": _ttr_position,
-            "ev_score":   ev_score(primary),
-            "verdict":    signal_verdict(primary),
+            "ev_score":   _ev,
+            "verdict":    verdict_from_ev(_ev),
+            "ev_primary": ev_score(primary),
             "bars":       len(bars),
         }
 
@@ -2350,6 +2449,16 @@ async def run(tickers=None, portfolio_mode=False):
             row["ev_score"] = min(row["ev_score"], 3.5)
             row["verdict"] = "🟢 BUY"
             row["gate"] = row.get("gate") or "PARABOLIC_CAP"
+
+        # v2.9 gate 3b — bear-regime momentum cap. Every earlier gate caps at
+        # BUY (3.5), which concentrated momentum names in the BUY tier — live
+        # the worst tier (−5.1% t+20d, −17.5% t+60d). With SPY 20d < 0,
+        # momentum-continuation primaries ran 7–20% WR; never above WATCH here.
+        if (spy_ret_20d is not None and spy_ret_20d < 0
+                and primary in _BEAR_REGIME_MOMENTUM and row["ev_score"] >= 2):
+            row["ev_score"] = min(row["ev_score"], 1.5)
+            row["verdict"] = "🟡 WATCH"
+            row["gate"] = row.get("gate") or f"BEAR_REGIME_MOMENTUM_CAP(spy20d={spy_ret_20d*100:+.1f}%)"
 
         # v1.10 gate 4 — 13F retail-heavy: demote EXECUTE when inst_pct < 10
         thirteen_f = get_13f_context(sym)
@@ -2598,7 +2707,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.8.3 (19-engine + ai_picks rank parser + eps_rev portfolio-scan) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.9 (19-engine + live-blended calibration + net-EV + bear-regime cap) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 

@@ -93,8 +93,32 @@ fi
 log "Enabling continuous scan timer"
 systemctl enable --now femisagent_loop.timer
 
+# Propagate Supabase/bridge env to the resolver + loop units via drop-ins.
+# (systemd's EnvironmentFile= silently failed to parse mcp.env on this box;
+# the Environment= drop-in form is what actually works.)
+if [ -f /etc/systemd/system/femisagent_mcp.service.d/env.conf ]; then
+  for unit in femisagent_outcome_resolver femisagent_loop; do
+    mkdir -p "/etc/systemd/system/${unit}.service.d"
+    cp /etc/systemd/system/femisagent_mcp.service.d/env.conf "/etc/systemd/system/${unit}.service.d/env.conf"
+  done
+  systemctl daemon-reload
+  log "Env drop-ins copied to resolver + loop units"
+fi
+
 log "Enabling nightly outcome resolver"
 systemctl enable --now femisagent_outcome_resolver.timer
+
+# Detect stale copies of femisagent_backtest.py elsewhere on disk. The weekly
+# backtest timer predates this stack and may point at one; from 2026-06-13 to
+# 2026-09-12 it wrote 49-ticker / 25-flag calibrations (no RSI_DIV, CEYHUN,
+# TTR stats) because it ran an old copy, not the one this installer updates.
+for f in $(find / -xdev -name femisagent_backtest.py 2>/dev/null | grep -v "^${SCRIPTS_DIR}/"); do
+  if ! grep -q "Auto-Backtest v2" "$f"; then
+    log "⚠️  STALE backtest script (49-ticker, no Pine-port flags): $f"
+    log "    Fix: cp ${SCRIPTS_DIR}/femisagent_backtest.py \"$f\"  — or repoint the weekly timer:"
+    log "         systemctl list-timers | grep -i backtest ; systemctl cat <unit>"
+  fi
+done
 
 log ""
 log "════ install complete ════"
