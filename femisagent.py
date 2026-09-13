@@ -617,38 +617,97 @@ def get_positions_via_bridge():
     req = _urllib_req.Request(
         f"{BRIDGE_URL}/mcp", data=payload, headers=headers, method="POST"
     )
+    # v2.9.2: this used to swallow every non-happy path (JSON-RPC error,
+    # isError tool result, dict-wrapped payload, plain-JSON body, TWS offline
+    # → []) and return [] silently, so every cron scan logged is_held=0 for
+    # three months. Now: parse SSE *or* plain JSON, unwrap {"positions": [...]},
+    # surface the bridge's own error text, and fall back to the last non-empty
+    # answer cached on disk (TWS on the Mac is closed most of the time; the
+    # holdings do not change between scans, only the marks do).
+    raw = ""
     try:
         with _urllib_req.urlopen(req, timeout=30) as r:
             raw = r.read().decode()
+        msgs = []
         for line in raw.splitlines():
             if line.startswith("data:"):
-                data = json.loads(line[5:].strip())
-                result = data.get("result", {})
-                content = result.get("content", [])
-                if content and content[0].get("type") == "text":
-                    positions_data = json.loads(content[0]["text"])
-                    out = []
-                    for pos in positions_data:
-                        sym = pos.get("symbol", "")
-                        exch = pos.get("exchange", "SMART")
-                        cur = pos.get("currency", "USD")
-                        # v2.3.3: bridge MCP sometimes returns numeric fields as
-                        # JSON strings — coerce defensively to avoid str/float
-                        # arithmetic errors downstream in the run loop.
-                        try:
-                            qty = float(pos.get("qty") or pos.get("position") or 0)
-                        except (TypeError, ValueError):
-                            qty = 0.0
-                        try:
-                            cost = float(pos.get("avgCost") or pos.get("avg_cost") or 0)
-                        except (TypeError, ValueError):
-                            cost = 0.0
-                        if sym:
-                            out.append((sym, exch, cur, qty, cost))
-                    return out
+                msgs.append(json.loads(line[5:].strip()))
+        if not msgs and raw.strip().startswith("{"):
+            msgs.append(json.loads(raw))
+        for data in msgs:
+            if "error" in data:
+                print(f"[femisagent] WARN: bridge get_positions JSON-RPC error: "
+                      f"{str(data['error'])[:200]}")
+                continue
+            result = data.get("result", {})
+            content = result.get("content", [])
+            text = content[0].get("text", "") if content and content[0].get("type") == "text" else ""
+            if result.get("isError"):
+                print(f"[femisagent] WARN: bridge get_positions tool error: {text[:200]}")
+                continue
+            if not text:
+                continue
+            positions_data = json.loads(text)
+            if isinstance(positions_data, dict):
+                positions_data = (positions_data.get("positions")
+                                  or positions_data.get("result") or [])
+            out = []
+            for pos in positions_data:
+                sym = pos.get("symbol", "")
+                exch = pos.get("exchange", "SMART")
+                cur = pos.get("currency", "USD")
+                # v2.3.3: bridge MCP sometimes returns numeric fields as
+                # JSON strings — coerce defensively to avoid str/float
+                # arithmetic errors downstream in the run loop.
+                try:
+                    qty = float(pos.get("qty") or pos.get("position") or 0)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                try:
+                    cost = float(pos.get("avgCost") or pos.get("avg_cost") or 0)
+                except (TypeError, ValueError):
+                    cost = 0.0
+                if sym and qty:
+                    out.append((sym, exch, cur, qty, cost))
+            if out:
+                _save_positions_cache(out)
+                return out
+            print(f"[femisagent] WARN: bridge get_positions returned no positions "
+                  f"(payload: {text[:160]!r})")
     except Exception as e:
-        print(f"[femisagent] WARN: bridge get_positions failed: {e}")
-    return []
+        print(f"[femisagent] WARN: bridge get_positions failed: {e} "
+              f"(raw: {raw[:160]!r})")
+    return _load_positions_cache()
+
+
+POSITIONS_CACHE = os.environ.get("FEMISA_POSITIONS_CACHE",
+                                 "/var/lib/femisagent/positions_cache.json")
+
+
+def _save_positions_cache(positions):
+    try:
+        os.makedirs(os.path.dirname(POSITIONS_CACHE), exist_ok=True)
+        with open(POSITIONS_CACHE, "w") as f:
+            json.dump({"ts": datetime.now().isoformat(timespec="seconds"),
+                       "positions": [list(p) for p in positions]}, f)
+    except Exception as e:
+        print(f"[femisagent] WARN: could not write {POSITIONS_CACHE}: {e}")
+
+
+def _load_positions_cache():
+    try:
+        with open(POSITIONS_CACHE) as f:
+            d = json.load(f)
+        out = [tuple(p) for p in d.get("positions", [])]
+        if out:
+            print(f"[femisagent] Using {len(out)} cached positions from "
+                  f"{d.get('ts')} ({POSITIONS_CACHE}) — bridge/TWS gave none")
+        return out
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"[femisagent] WARN: positions cache unreadable: {e}")
+        return []
 
 def make_bar_obj(d):
     class Bar:
