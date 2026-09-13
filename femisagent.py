@@ -340,6 +340,8 @@ LIVE_BLEND_DAYS    = int(os.environ.get("FEMISA_LIVE_DAYS", "90"))
 LIVE_BLEND_MIN_N   = int(os.environ.get("FEMISA_LIVE_MIN_N", "30"))
 LIVE_BLEND_K       = float(os.environ.get("FEMISA_LIVE_K", "60"))
 LIVE_BLEND_MIN_ABS = float(os.environ.get("FEMISA_LIVE_MIN_ABS", "1.0"))
+# v2.9.3: Beneish M-score hard cap (EV→0.5/WATCH) is opt-in; see gate 2.
+BENEISH_HARD_CAP   = os.environ.get("FEMISA_BENEISH_HARD_CAP", "0") == "1"
 
 # Momentum-continuation primaries that live outcomes showed at 7–20% WR when
 # SPY's 20d return was negative. Capped at WATCH in that regime (gate 3b).
@@ -437,6 +439,8 @@ _FLAG_FAMILY_PREFIXES = (
 
 def flag_family(flag):
     """Collapse a parameterised gate flag to its family name; identity otherwise."""
+    if not flag:
+        return flag
     if flag.startswith("AI_PICK_TOP5_RANK"):
         return "AI_PICK_TOP5"
     for p in _FLAG_FAMILY_PREFIXES:
@@ -2531,12 +2535,19 @@ async def run(tickers=None, portfolio_mode=False):
             row["verdict"] = "🟡 WATCH"
             row["gate"] = f"EARNINGS_IN_{dte}D"
 
-        # v1.9 gate 2 — Beneish M-Score: demote if accruals/manipulation risk
+        # v1.9 gate 2 — Beneish M-Score: accruals/manipulation risk.
+        # v2.9.3: hard cap is now OPT-IN (FEMISA_BENEISH_HARD_CAP=1). Live
+        # outcomes Jun–Sep 2026 (t+20d): BENEISH_RISK rows −0.5% vs −3.05%
+        # baseline; HRT_WEAK+BENEISH +10.6% (n=90) vs HRT_WEAK alone +3.9%.
+        # The M-score is an accounting screen, not a 20-day return predictor,
+        # and the cap was zeroing the best-performing cohort. The flag is
+        # still recorded, still shown in the gate note, and still feeds the
+        # live blend (which will penalise it if it ever earns a penalty).
         m = get_beneish_m(sym)
         row["beneish_m"] = m
         if m is not None and m > -1.78:
             row["all_flags"].append("BENEISH_RISK")
-            if row["ev_score"] >= 2:
+            if BENEISH_HARD_CAP and row["ev_score"] >= 2:
                 row["ev_score"] = min(row["ev_score"], 0.5)
                 row["verdict"] = "🟡 WATCH"
             row["gate"] = row.get("gate") or f"BENEISH_M={m}"
@@ -2780,6 +2791,22 @@ async def run(tickers=None, portfolio_mode=False):
             rank = ai_pick.get("rank", 0)
             row["all_flags"].append(f"AI_PICK_TOP5_RANK{rank}")
 
+        # v2.9.3 — final net-EV pass over ALL flags. The v2.9 penalty at row
+        # build only saw compute_flags output; every gate-layer flag appended
+        # above (TAF_OVERBOUGHT, AI_PICK_TOP5, OPTIONS_*, …) was invisible to
+        # it. 2026-09-13 scan: AMD kept +2.8 BUY with three live-negative
+        # co-fires (TAF_OVERBOUGHT −4.7, AI_PICK_TOP5 −5.4, TAF_OBV_BEAR_DIV
+        # −2.1). EVs resolve through flag_family(), so parameterised variants
+        # count. Gate caps stay in force: take the lower of capped and net.
+        _neg_all = [ev_score(f) for f in row["all_flags"]
+                    if f != primary and ev_score(f) < 0]
+        _net_all = round(row["ev_primary"] + (0.5 * min(_neg_all) if _neg_all else 0.0), 1)
+        if _net_all < row["ev_score"]:
+            row["ev_score"] = _net_all
+            row["verdict"] = verdict_from_ev(_net_all)
+            _worst = min(row["all_flags"], key=lambda f: ev_score(f) if f != primary else 0)
+            row["gate"] = row.get("gate") or f"NET_EV({_worst} {ev_score(_worst):+.1f})"
+
         if sym in portfolio_data:
             pos = portfolio_data[sym]
             row["qty"]      = pos["qty"]
@@ -2804,7 +2831,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.9.2 (19-engine + live-blended calibration + flag-family stats + net-EV + bear-regime cap) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.9.3 (19-engine + live-blended calibration + flag-family stats + full net-EV + bear-regime cap) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
