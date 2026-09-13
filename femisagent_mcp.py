@@ -394,7 +394,9 @@ def run_http(host: str, port: int):
             # Starlette answers POST /mcp with 307 → /mcp/ before any mounted
             # handler runs, so the auth check must sit in front of routing,
             # and the redirect itself is absorbed here.
-            if scope.get("path") == "/mcp":
+            # Tailscale Funnel (--set-path=/mcp → http://localhost:8766)
+            # strips the prefix and forwards "/", so accept that too.
+            if scope.get("path") in ("/mcp", "/", ""):
                 scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
             if token:
                 hdrs = {k.lower(): v for k, v in (scope.get("headers") or [])}
