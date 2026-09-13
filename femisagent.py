@@ -419,10 +419,37 @@ def verdict_from_ev(ev):
     return "🔴 AVOID"
 
 
+# v2.9.2: gate-layer flags carry their parameter in the name
+# (SENT_CONFIRM_+0.75, SHORT_SQUEEZE_RISK_si25_dtc4.5, AI_PICK_TOP5_RANK2 …).
+# Each variant is a separate bucket in the live-outcome table, so none ever
+# reached the n>=30 floor and the blend could not learn from them. Both the
+# RPC (femisagent_flag_family() in Postgres) and ev_score() collapse a
+# variant to its family. Backtested compute_flags names (HRT_STRONG_v4,
+# MULTI_CONFLUENCE_3, 20D_BREAKOUT) are deliberately NOT in this list.
+_FLAG_FAMILY_PREFIXES = (
+    "SENT_CONFIRM_", "SENT_NEG_", "OPTIONS_CALL_HEAVY_", "OPTIONS_PUT_HEAVY_",
+    "LPPLS_BUBBLE_", "FA_CONVICTION_", "TAF_EXEC_", "PD_OVERVALUED_", "PD_UPSIDE_",
+    "INSIDER_BUY_CLUSTER_", "INSIDER_SELL_HEAVY_", "EPS_REV_UP_STRONG_",
+    "CONGRESS_BUY_", "CONGRESS_SELL_", "SHORT_SQUEEZE_RISK_", "SHORT_ELEVATED_",
+    "VOL_ANOMALY_SURGE_", "VOL_ANOMALY_COLLAPSE_",
+)
+
+
+def flag_family(flag):
+    """Collapse a parameterised gate flag to its family name; identity otherwise."""
+    if flag.startswith("AI_PICK_TOP5_RANK"):
+        return "AI_PICK_TOP5"
+    for p in _FLAG_FAMILY_PREFIXES:
+        if flag.startswith(p):
+            return p.rstrip("_")
+    return flag
+
+
 def ev_score(flag):
     """v1.4: prefer baseline-adjusted excess_ret when available, fall back
-    to raw win_rate * avg_ret for legacy rows (id 1-5)."""
-    s = FLAG_STATS.get(flag, {})
+    to raw win_rate * avg_ret for legacy rows (id 1-5).
+    v2.9.2: falls back to the flag's family stats (see flag_family)."""
+    s = FLAG_STATS.get(flag) or FLAG_STATS.get(flag_family(flag), {})
     if "excess_ret" in s:
         return round(s["excess_ret"], 1)
     return round(s.get("win_rate", 0) * s.get("avg_ret", 0), 1)
@@ -2718,7 +2745,7 @@ async def run(tickers=None, portfolio_mode=False):
 def print_report(results):
     results.sort(key=lambda x: x["ev_score"], reverse=True)
     print("\n" + "="*80)
-    print(f"FEMISAGENT v2.9 (19-engine + live-blended calibration + net-EV + bear-regime cap) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"FEMISAGENT v2.9.2 (19-engine + live-blended calibration + flag-family stats + net-EV + bear-regime cap) — SIGNAL REPORT | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"Calibration: {CALIBRATION_SOURCE}")
     print("="*80)
 
