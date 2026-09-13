@@ -67,7 +67,8 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 log "Installing MCP server deps into venv"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet mcp starlette uvicorn 2>&1 | tail -5 || \
+# mcp 2.x removed the low-level Server.list_tools() API the server uses — pin 1.x.
+"$VENV_DIR/bin/pip" install --quiet "mcp<2" starlette uvicorn 2>&1 | tail -5 || \
   log "⚠️  pip install in venv failed — check $VENV_DIR/bin/pip install mcp"
 
 # Enable MCP server (HTTP mode) — listens on localhost:8766 by default.

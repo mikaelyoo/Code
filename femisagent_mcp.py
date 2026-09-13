@@ -375,20 +375,41 @@ def run_http(host: str, port: int):
                     "UNAUTHENTICATED. Do not expose it via Funnel like this.")
 
     async def handle(scope, receive, send):
-        if token and scope.get("type") == "http":
-            hdrs = {k.lower(): v for k, v in (scope.get("headers") or [])}
-            auth = hdrs.get(b"authorization", b"").decode("utf-8", "replace")
-            if not hmac.compare_digest(auth, f"Bearer {token}"):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"application/json"),
-                                        (b"www-authenticate", b"Bearer")]})
-                await send({"type": "http.response.body",
-                            "body": b'{"error":"unauthorized"}'})
-                return
         await manager.handle_request(scope, receive, send)
 
-    app = Starlette(routes=[Mount("/mcp", app=handle)])
-    log.info(f"MCP server listening on http://{host}:{port}/mcp")
+    # StreamableHTTPSessionManager needs its task group started via run();
+    # without this lifespan every request failed once a client got past the
+    # router.
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        async with manager.run():
+            yield
+
+    inner = Starlette(routes=[Mount("/mcp", app=handle)], lifespan=lifespan)
+
+    async def app(scope, receive, send):
+        if scope.get("type") == "http":
+            # Starlette answers POST /mcp with 307 → /mcp/ before any mounted
+            # handler runs, so the auth check must sit in front of routing,
+            # and the redirect itself is absorbed here.
+            if scope.get("path") == "/mcp":
+                scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
+            if token:
+                hdrs = {k.lower(): v for k, v in (scope.get("headers") or [])}
+                auth = hdrs.get(b"authorization", b"").decode("utf-8", "replace")
+                if not hmac.compare_digest(auth, f"Bearer {token}"):
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"application/json"),
+                                            (b"www-authenticate", b"Bearer")]})
+                    await send({"type": "http.response.body",
+                                "body": b'{"error":"unauthorized"}'})
+                    return
+        await inner(scope, receive, send)
+
+    log.info(f"MCP server listening on http://{host}:{port}/mcp "
+             f"({'bearer auth ON' if token else 'NO AUTH'})")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
