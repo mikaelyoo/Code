@@ -361,7 +361,30 @@ def run_http(host: str, port: int):
 
     manager = StreamableHTTPSessionManager(app=server, stateless=False)
 
+    # Bearer-token auth (2026-09-13). The HTTP endpoint is published to the
+    # public internet through Tailscale Funnel, and until now accepted any
+    # caller: run_scan / query_portfolio / propose_rebalance were open to the
+    # world. Set FEMISA_MCP_TOKEN in /etc/femisagent/mcp.env (or the systemd
+    # drop-in); every request to /mcp must then carry
+    # "Authorization: Bearer <token>". Unset → server still starts (so a
+    # localhost-only deployment keeps working) but logs a loud warning.
+    import hmac
+    token = os.environ.get("FEMISA_MCP_TOKEN", "").strip()
+    if not token:
+        log.warning("FEMISA_MCP_TOKEN is not set — the MCP HTTP endpoint is "
+                    "UNAUTHENTICATED. Do not expose it via Funnel like this.")
+
     async def handle(scope, receive, send):
+        if token and scope.get("type") == "http":
+            hdrs = {k.lower(): v for k, v in (scope.get("headers") or [])}
+            auth = hdrs.get(b"authorization", b"").decode("utf-8", "replace")
+            if not hmac.compare_digest(auth, f"Bearer {token}"):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"error":"unauthorized"}'})
+                return
         await manager.handle_request(scope, receive, send)
 
     app = Starlette(routes=[Mount("/mcp", app=handle)])

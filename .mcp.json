@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "femisagent": {
+      "type": "http",
+      "url": "https://srv1355468.tail7d57fe.ts.net/mcp",
+      "headers": {
+        "Authorization": "Bearer ${FEMISA_MCP_TOKEN}"
+      }
+    }
+  }
+}
