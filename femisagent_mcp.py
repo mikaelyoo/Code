@@ -183,13 +183,48 @@ def _running_job() -> dict | None:
     return None
 
 
+SCAN_MAX_MIN = float(os.environ.get("FEMISA_SCAN_MAX_MIN", "45"))
+
+
+def _kill_job(job: dict, reason: str) -> bool:
+    """SIGTERM the scan's whole process group (start_new_session=True made the
+    scanner its own group). Returns True if a signal was sent."""
+    import signal
+    if job["proc"].poll() is not None:
+        return False
+    try:
+        os.killpg(job["proc"].pid, signal.SIGTERM)
+        job["killed"] = reason
+        log.warning(f"scan job {job['id']} killed: {reason}")
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def tool_cancel_scan(job_id: str | None = None) -> dict:
+    job = _JOBS.get(job_id) if job_id else _running_job()
+    if not job:
+        return {"error": "no running scan" if not job_id else f"unknown job_id {job_id}"}
+    sent = _kill_job(job, "cancel_scan")
+    time.sleep(1)
+    return {"job_id": job["id"], "signalled": sent, **_job_status(job)}
+
+
 def _job_status(job: dict) -> dict:
+    # Auto-kill a job that has run past SCAN_MAX_MIN (a hung bridge/TWS call
+    # otherwise blocks every later run_scan, since only one job may run).
+    if job["proc"].poll() is None and "t0" in job \
+            and time.time() - job["t0"] > SCAN_MAX_MIN * 60:
+        _kill_job(job, f"exceeded FEMISA_SCAN_MAX_MIN={SCAN_MAX_MIN:g}")
     rc = job["proc"].poll()
     st = {
         "job_id": job["id"],
         "tickers": job["tickers"],
         "started": job["started"],
-        "state": "running" if rc is None else ("finished" if rc == 0 else f"failed(rc={rc})"),
+        "elapsed_s": int(time.time() - job["t0"]) if "t0" in job else None,
+        "state": ("running" if rc is None else
+                  ("finished" if rc == 0 else
+                   f"killed({job['killed']})" if job.get("killed") else f"failed(rc={rc})")),
         "log": str(job["log"]),
         **_progress_from_log(job["log"]),
     }
@@ -222,7 +257,8 @@ def tool_run_scan(tickers: list[str], wait_seconds: int = 45) -> dict:
         cmd, cwd=str(SCRIPTS_DIR), stdout=log_fh, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL, start_new_session=True)
     job = {"id": job_id, "proc": proc, "tickers": tickers, "log": log_path,
-           "log_fh": log_fh, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+           "log_fh": log_fh, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "t0": time.time()}
     _JOBS[job_id] = job
     log.info(f"scan job {job_id} started: {len(tickers)} tickers, pid {proc.pid}")
     deadline = time.time() + max(0, min(int(wait_seconds or 0), 50))
@@ -433,6 +469,11 @@ TOOLS_SCHEMA = [
         },
     ),
     Tool(
+        name="cancel_scan",
+        description="Kill a running background scan (default: the current one). Use when scan_status shows no progress for several minutes, e.g. stuck on 'Fetching portfolio via bridge'.",
+        inputSchema={"type": "object", "properties": {"job_id": {"type": "string"}}},
+    ),
+    Tool(
         name="sync_positions",
         description=(
             "Push the user's current IBKR holdings into the scanner's positions "
@@ -532,6 +573,7 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
     impl = {
         "run_scan": tool_run_scan,
         "scan_status": tool_scan_status,
+        "cancel_scan": tool_cancel_scan,
         "sync_positions": tool_sync_positions,
         "query_portfolio": tool_query_portfolio,
         "query_signal_history": tool_query_signal_history,

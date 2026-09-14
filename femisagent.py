@@ -594,6 +594,38 @@ def _fetch_bars_via_yfinance(symbol, days=90):
 
 
 def get_positions_via_bridge():
+    """Hard wall-clock cap around the bridge positions call (v2.9.3).
+
+    urlopen(timeout=30) only bounds socket *inactivity*. When TWS is half-
+    connected the bridge holds the SSE stream open with keepalives while its
+    own IBKR call hangs, so r.read() never returns and the whole scan sat on
+    "Fetching portfolio via bridge..." indefinitely (2026-09-14 15:40 UTC).
+    Run the fetch in a daemon thread and fall back to the on-disk cache after
+    FEMISA_POSITIONS_TIMEOUT seconds (default 45)."""
+    import threading
+    cap = float(os.environ.get("FEMISA_POSITIONS_TIMEOUT", "45"))
+    box = {}
+
+    def _worker():
+        try:
+            box["out"] = _get_positions_via_bridge_inner()
+        except Exception as e:  # pragma: no cover — inner already catches
+            box["err"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(cap)
+    if t.is_alive():
+        print(f"[femisagent] WARN: bridge get_positions hung >{cap:.0f}s "
+              f"(TWS half-connected?) — falling back to positions cache")
+        return _load_positions_cache()
+    if "err" in box:
+        print(f"[femisagent] WARN: bridge get_positions failed: {box['err']}")
+        return _load_positions_cache()
+    return box.get("out") or []
+
+
+def _get_positions_via_bridge_inner():
     """Fetch portfolio positions via the bridge's get_positions MCP tool.
 
     Returns a list of (symbol, exchange, currency, qty, avgCost) tuples
