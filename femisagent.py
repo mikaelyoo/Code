@@ -2813,7 +2813,10 @@ async def run(tickers=None, portfolio_mode=False):
             # v2.3.3: defensive float casts — bridge returns sometimes vary in type
             try:
                 ac = float(pos["avgCost"])
-                cf = float(c)
+                # v2.9.3: `c` was rebound to the TA-fusion CCI signal string a
+                # few hundred lines up, so float(c) always raised and
+                # unreal_pct was 0 on every held row. Use the row's price.
+                cf = float(row["price"])
                 row["avg_cost"] = round(ac, 2)
                 row["unreal_pct"] = round((cf - ac) / ac * 100, 1) if ac else 0
             except (TypeError, ValueError, KeyError):
