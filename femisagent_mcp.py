@@ -213,8 +213,10 @@ def tool_run_scan(tickers: list[str], wait_seconds: int = 45) -> dict:
     log_path = JOBS_DIR / f"scan_{job_id}.log"
     # System python3, not this server's venv: the scanner's deps (ib_insync,
     # yfinance, pandas) live in the system interpreter, same as the cron.
+    # --portfolio: union held names in and annotate qty/avg_cost (the cron does
+    # this; v1 of this tool did not, so MCP scans could never show holdings).
     cmd = [os.environ.get("FEMISA_SCAN_PYTHON", "python3"), "-u",
-           str(SCRIPTS_DIR / "femisagent.py"), "--tickers"] + tickers
+           str(SCRIPTS_DIR / "femisagent.py"), "--portfolio", "--tickers"] + tickers
     log_fh = log_path.open("w")
     proc = subprocess.Popen(
         cmd, cwd=str(SCRIPTS_DIR), stdout=log_fh, stderr=subprocess.STDOUT,
@@ -232,6 +234,35 @@ def tool_run_scan(tickers: list[str], wait_seconds: int = 45) -> dict:
                       f"Call scan_status(job_id='{job_id}') to poll; the result is "
                       f"attached when state == 'finished'.")
     return st
+
+
+POSITIONS_CACHE = Path(os.environ.get("FEMISA_POSITIONS_CACHE",
+                                      "/var/lib/femisagent/positions_cache.json"))
+
+
+def tool_sync_positions(positions: list[dict], source: str = "claude-ibkr-connector") -> dict:
+    """Write held positions into the scanner's positions cache. femisagent.py
+    (v2.9.2+) falls back to this file whenever the bridge/TWS returns no
+    positions, so a Claude session that can read the IBKR account (via the
+    IBKR connector) becomes the position feed when TWS on the Mac is closed."""
+    rows = []
+    for p in positions or []:
+        sym = str(p.get("symbol") or p.get("ticker") or "").strip().upper()
+        try:
+            qty = float(p.get("qty") if p.get("qty") is not None else p.get("position") or 0)
+            cost = float(p.get("avg_cost") if p.get("avg_cost") is not None else p.get("average_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sym and qty:
+            rows.append([sym, p.get("exchange") or "SMART", p.get("currency") or "USD", qty, cost])
+    if not rows:
+        return {"error": "no valid positions (need symbol + non-zero qty)"}
+    POSITIONS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    POSITIONS_CACHE.write_text(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "source": source, "positions": rows}))
+    return {"written": len(rows), "path": str(POSITIONS_CACHE),
+            "tickers": [r[0] for r in rows],
+            "note": "Used by scans when the bridge/TWS returns no positions. Pass --portfolio scans (cron does; run_scan does)."}
 
 
 def tool_scan_status(job_id: str | None = None) -> dict:
@@ -402,6 +433,37 @@ TOOLS_SCHEMA = [
         },
     ),
     Tool(
+        name="sync_positions",
+        description=(
+            "Push the user's current IBKR holdings into the scanner's positions "
+            "cache (/var/lib/femisagent/positions_cache.json). Use after reading "
+            "positions from the IBKR connector (get_account_positions) so scans "
+            "annotate held names with qty/avg_cost even when TWS on the Mac is "
+            "closed. Each item: {symbol, qty, avg_cost}; negative qty = short."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "positions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                            "qty": {"type": "number"},
+                            "avg_cost": {"type": "number"},
+                            "currency": {"type": "string"},
+                            "exchange": {"type": "string"},
+                        },
+                        "required": ["symbol", "qty"],
+                    },
+                },
+                "source": {"type": "string", "default": "claude-ibkr-connector"},
+            },
+            "required": ["positions"],
+        },
+    ),
+    Tool(
         name="query_portfolio",
         description="Get current held positions with latest scan verdicts. Use when asked about 'my book', 'my positions', or 'what do I hold'.",
         inputSchema={"type": "object", "properties": {}},
@@ -470,6 +532,7 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
     impl = {
         "run_scan": tool_run_scan,
         "scan_status": tool_scan_status,
+        "sync_positions": tool_sync_positions,
         "query_portfolio": tool_query_portfolio,
         "query_signal_history": tool_query_signal_history,
         "query_outcomes_by_flag": tool_query_outcomes_by_flag,
