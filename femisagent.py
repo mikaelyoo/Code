@@ -526,7 +526,42 @@ def _bridge_session():
     return _BRIDGE_SESSION
 
 
+def _call_capped(fn, cap, what, fallback):
+    """Run fn() in a daemon thread; after `cap` seconds give up and return
+    fallback. urlopen's timeout only bounds socket inactivity, and the bridge
+    keeps its SSE stream alive with keepalives while a hung IBKR call never
+    completes, so a wall-clock cap is the only reliable bound."""
+    import threading
+    box = {}
+
+    def _w():
+        try:
+            box["out"] = fn()
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=_w, daemon=True)
+    t.start()
+    t.join(cap)
+    if t.is_alive():
+        print(f"[femisagent] WARN: {what} hung >{cap:.0f}s — using fallback")
+        return fallback
+    if "err" in box:
+        print(f"[femisagent] WARN: {what} failed: {box['err']}")
+        return fallback
+    return box.get("out", fallback)
+
+
+BARS_TIMEOUT = float(os.environ.get("FEMISA_BARS_TIMEOUT", "40"))
+
+
 def fetch_bars_via_bridge(symbol):
+    """Wall-clock-capped wrapper (v2.9.3); [] → caller falls back to yfinance."""
+    return _call_capped(lambda: _fetch_bars_via_bridge_inner(symbol), BARS_TIMEOUT,
+                        f"bridge fetch_bars({symbol})", [])
+
+
+def _fetch_bars_via_bridge_inner(symbol):
     """Fetch bars from Jarvis bridge instead of direct IBKR connection.
 
     v1.8.2: now does the MCP session handshake (initialize → cache
