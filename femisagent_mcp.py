@@ -50,6 +50,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -97,55 +98,173 @@ def _supabase_get(path, params):
         return json.loads(r.read())
 
 
-def tool_run_scan(tickers: list[str]) -> dict:
+def _load_last_run() -> dict | None:
+    """femisagent.py writes {"run_date", "calibration_source", "signals": [...],
+    "summary"}. v1 of this server read "results"/"scan_ts"/"calibration_info",
+    keys that never existed, so run_scan reported 0 tickers and
+    query_portfolio was always empty."""
+    if not LAST_RUN_PATH.exists():
+        return None
+    with LAST_RUN_PATH.open() as f:
+        return json.load(f)
+
+
+def _row_view(x: dict) -> dict:
+    out = {
+        "ticker": x.get("symbol"),
+        "verdict": x.get("verdict"),
+        "ev_score": x.get("ev_score"),
+        "primary_flag": x.get("flag"),
+        "flags": (x.get("all_flags") or [])[:8],
+        "price": x.get("price"),
+    }
+    if x.get("gate"):
+        out["gate"] = x["gate"]
+    if x.get("qty"):
+        out["qty"] = x["qty"]
+        out["avg_cost"] = x.get("avg_cost")
+        out["unreal_pct"] = x.get("unreal_pct")
+    return out
+
+
+def _scan_summary(run: dict) -> dict:
+    sig = run.get("signals") or []
+    tiers: dict[str, list] = {}
+    for x in sig:
+        v = x.get("verdict") or ""
+        tier = next((t for t in ("EXECUTE", "BUY", "WATCH", "AVOID") if t in v), "OTHER")
+        tiers.setdefault(tier, []).append(_row_view(x))
+    for t in tiers:
+        tiers[t].sort(key=lambda r: -(r.get("ev_score") or 0))
+    return {
+        "run_date": run.get("run_date"),
+        "calibration": run.get("calibration_source"),
+        "scanned": len(sig),
+        "counts": {t: len(v) for t, v in tiers.items()},
+        "by_tier": tiers,
+    }
+
+
+# ── Background scan jobs ─────────────────────────────────────────────────────
+# A scan takes ~1 min per ticker (gate-layer lookups). The MCP client's tool
+# timeout is 60 s, and v1 ran the scanner with subprocess.run() *inside the
+# async handler*, which blocked the event loop for every other request — one
+# 14-ticker call froze the whole server for 15 minutes. Scans now run as a
+# detached process; run_scan returns as soon as the job is started (or after
+# `wait_seconds` if it finishes sooner) and scan_status polls it.
+
+JOBS_DIR = Path(os.environ.get("FEMISA_JOBS_DIR", "/var/lib/femisagent/jobs"))
+_JOBS: dict[str, dict] = {}
+_PROGRESS_RE = None
+
+
+def _progress_from_log(log_path: Path) -> dict:
+    global _PROGRESS_RE
+    import re
+    if _PROGRESS_RE is None:
+        _PROGRESS_RE = re.compile(r"^\s*\[(\d+)/(\d+)\]\s+(\S+)")
+    done, total, last = 0, None, None
+    try:
+        text = log_path.read_text(errors="replace")
+    except FileNotFoundError:
+        return {"done": 0, "total": None, "current": None, "tail": ""}
+    for line in text.splitlines():
+        m = _PROGRESS_RE.match(line)
+        if m:
+            done, total, last = int(m.group(1)), int(m.group(2)), m.group(3).rstrip(".")
+    return {"done": done, "total": total, "current": last,
+            "tail": "\n".join(text.splitlines()[-6:])}
+
+
+def _running_job() -> dict | None:
+    for j in _JOBS.values():
+        if j["proc"].poll() is None:
+            return j
+    return None
+
+
+def _job_status(job: dict) -> dict:
+    rc = job["proc"].poll()
+    st = {
+        "job_id": job["id"],
+        "tickers": job["tickers"],
+        "started": job["started"],
+        "state": "running" if rc is None else ("finished" if rc == 0 else f"failed(rc={rc})"),
+        "log": str(job["log"]),
+        **_progress_from_log(job["log"]),
+    }
+    if rc == 0:
+        run = _load_last_run()
+        if run:
+            st["result"] = _scan_summary(run)
+    return st
+
+
+def tool_run_scan(tickers: list[str], wait_seconds: int = 45) -> dict:
+    tickers = [t.strip().upper() for t in (tickers or []) if t and t.strip()]
     if not tickers:
         return {"error": "no tickers provided"}
-    cmd = ["python3", str(SCRIPTS_DIR / "femisagent.py"), "--tickers"] + list(tickers)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=str(SCRIPTS_DIR))
-    except subprocess.TimeoutExpired:
-        return {"error": "scan timed out (5 min cap)"}
-    if LAST_RUN_PATH.exists():
-        with LAST_RUN_PATH.open() as f:
-            run = json.load(f)
-        return {
-            "scanned": len(run.get("results", [])),
-            "calibration": run.get("calibration_info"),
-            "results": [
-                {
-                    "ticker": x["symbol"],
-                    "verdict": x.get("verdict"),
-                    "ev_score": x.get("ev_score"),
-                    "flags": x.get("all_flags", [])[:6],
-                    "price": x.get("price"),
-                }
-                for x in run.get("results", [])
-            ],
-        }
-    return {"error": "scan ran but no last_run.json found", "stderr": r.stderr[-1500:]}
+    cur = _running_job()
+    if cur:
+        return {"error": "a scan is already running — poll scan_status, then retry",
+                **_job_status(cur)}
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = time.strftime("%Y%m%dT%H%M%S")
+    log_path = JOBS_DIR / f"scan_{job_id}.log"
+    # System python3, not this server's venv: the scanner's deps (ib_insync,
+    # yfinance, pandas) live in the system interpreter, same as the cron.
+    cmd = [os.environ.get("FEMISA_SCAN_PYTHON", "python3"), "-u",
+           str(SCRIPTS_DIR / "femisagent.py"), "--tickers"] + tickers
+    log_fh = log_path.open("w")
+    proc = subprocess.Popen(
+        cmd, cwd=str(SCRIPTS_DIR), stdout=log_fh, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+    job = {"id": job_id, "proc": proc, "tickers": tickers, "log": log_path,
+           "log_fh": log_fh, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    _JOBS[job_id] = job
+    log.info(f"scan job {job_id} started: {len(tickers)} tickers, pid {proc.pid}")
+    deadline = time.time() + max(0, min(int(wait_seconds or 0), 50))
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(1)
+    st = _job_status(job)
+    if st["state"] == "running":
+        st["hint"] = (f"Scan takes ~1 min per ticker ({len(tickers)} tickers). "
+                      f"Call scan_status(job_id='{job_id}') to poll; the result is "
+                      f"attached when state == 'finished'.")
+    return st
+
+
+def tool_scan_status(job_id: str | None = None) -> dict:
+    if not _JOBS:
+        run = _load_last_run()
+        return {"state": "no jobs in this server process",
+                "last_run": _scan_summary(run) if run else None}
+    job = _JOBS.get(job_id) if job_id else _JOBS[max(_JOBS)]
+    if not job:
+        return {"error": f"unknown job_id {job_id}", "known": sorted(_JOBS)}
+    return _job_status(job)
 
 
 def tool_query_portfolio() -> dict:
-    if not LAST_RUN_PATH.exists():
+    run = _load_last_run()
+    if not run:
         return {"error": "no recent scan available — run a scan first"}
-    with LAST_RUN_PATH.open() as f:
-        run = json.load(f)
-    held = [r for r in run.get("results", []) if r.get("qty")]
-    return {
-        "scan_ts": run.get("scan_ts"),
-        "calibration": run.get("calibration_info"),
+    sig = run.get("signals") or []
+    held = [r for r in sig if r.get("qty")]
+    out = {
+        "run_date": run.get("run_date"),
+        "calibration": run.get("calibration_source"),
+        "scanned": len(sig),
         "held_count": len(held),
-        "positions": [
-            {
-                "ticker": r["symbol"],
-                "qty": r.get("qty"),
-                "verdict": r.get("verdict"),
-                "ev": r.get("ev_score"),
-                "flags": r.get("all_flags", [])[:6],
-            }
-            for r in held
-        ],
+        "positions": sorted((_row_view(r) for r in held),
+                            key=lambda r: -(r.get("ev_score") or 0)),
     }
+    if not held:
+        out["note"] = ("No held positions in the last scan. Either the book is flat, "
+                       "or TWS on the Mac was closed so the bridge returned no "
+                       "positions (see 'Watchlist union' / 'cached positions' lines "
+                       "in the scan log).")
+    return out
 
 
 def tool_query_signal_history(ticker: str, days: int = 30) -> dict:
@@ -244,7 +363,15 @@ server = Server("femisagent")
 TOOLS_SCHEMA = [
     Tool(
         name="run_scan",
-        description="Run femisagent v2.8.3 scan on specific tickers (uses live calibration id=15). Returns verdict tier, EV, top flags per ticker.",
+        description=(
+            "Start a femisagent scan (v2.9.x, latest Supabase calibration + live "
+            "blend) on specific tickers as a BACKGROUND JOB. Each ticker takes "
+            "~1 minute. Returns immediately with job_id and state; if state is "
+            "'running', poll scan_status(job_id) every ~60 s until 'finished' — "
+            "the result (verdict tier, EV, flags, gate per ticker, grouped by tier) "
+            "is attached then. Only one scan runs at a time. Ad-hoc scans are NOT "
+            "logged to femisagent_signal_outcomes (the cron scans are)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -252,9 +379,26 @@ TOOLS_SCHEMA = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Stock symbols to scan, e.g. ['NVDA', 'AMD', 'MU']",
-                }
+                },
+                "wait_seconds": {
+                    "type": "integer", "default": 45,
+                    "description": "Seconds to wait for completion before returning (max 50; keep under the client's 60 s tool timeout)",
+                },
             },
             "required": ["tickers"],
+        },
+    ),
+    Tool(
+        name="scan_status",
+        description=(
+            "Progress/result of a background scan started by run_scan. Without "
+            "job_id returns the most recent job. Fields: state (running/finished/"
+            "failed), done/total tickers, current ticker, log tail; 'result' "
+            "(by_tier: EXECUTE/BUY/WATCH/AVOID) once finished."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}},
         },
     ),
     Tool(
@@ -325,6 +469,7 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
     args = arguments or {}
     impl = {
         "run_scan": tool_run_scan,
+        "scan_status": tool_scan_status,
         "query_portfolio": tool_query_portfolio,
         "query_signal_history": tool_query_signal_history,
         "query_outcomes_by_flag": tool_query_outcomes_by_flag,
@@ -335,7 +480,11 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
         result = {"error": f"unknown tool: {name}"}
     else:
         try:
-            result = impl(**args)
+            # Every implementation is synchronous (urllib, subprocess, file
+            # I/O). Run it off the event loop so one slow call cannot stall
+            # the other sessions' requests.
+            import asyncio
+            result = await asyncio.to_thread(impl, **args)
         except Exception as e:
             log.exception(f"Tool {name} crashed")
             result = {"error": f"{type(e).__name__}: {e}"}
