@@ -2483,18 +2483,76 @@ def _clean_bars(bars, ticker):
     return out
 
 
+def _bar_date(b):
+    """Calendar date of a bar from any source (str 'YYYY-MM-DD…', 'YYYYMMDD',
+    datetime/date, pandas Timestamp). None if unparseable."""
+    import datetime as _dt
+    d = getattr(b, "date", None)
+    if d is None:
+        return None
+    if hasattr(d, "to_pydatetime"):
+        d = d.to_pydatetime()
+    if isinstance(d, _dt.datetime):
+        return d.date()
+    if isinstance(d, _dt.date):
+        return d
+    s = str(d).strip()
+    digits = "".join(ch for ch in s[:10] if ch.isdigit())
+    try:
+        return _dt.date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    except (ValueError, IndexError):
+        return None
+
+
+def _expected_last_trading_date():
+    """Most recent US session whose close (16:00 ET) has passed. Weekends
+    only; holidays make the check one day too strict, which just costs one
+    extra yfinance lookup."""
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        now = _dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = _dt.datetime.utcnow() - _dt.timedelta(hours=4)
+    d = now.date()
+    if now.weekday() < 5 and now.hour * 60 + now.minute < 16 * 60 + 5:
+        d -= _dt.timedelta(days=1)          # session still open / not closed yet
+    while d.weekday() >= 5:
+        d -= _dt.timedelta(days=1)
+    return d
+
+
+FRESHNESS_CHECK = os.environ.get("FEMISA_FRESHNESS_CHECK", "1") == "1"
+
+
+def _stale_by(bars):
+    """Days the last bar lags the expected last session; 0 if fresh/unknown."""
+    if not FRESHNESS_CHECK or not bars:
+        return 0
+    last = _bar_date(bars[-1])
+    if last is None:
+        return 0
+    return max(0, (_expected_last_trading_date() - last).days)
+
+
 async def fetch_bars(ib, ticker, exchange="SMART", currency="USD"):
     if USE_BRIDGE and BRIDGE_TOKEN:
         raw = fetch_bars_via_bridge(ticker)
-        if raw:
-            bars = _clean_bars([make_bar_obj(d) for d in raw], ticker)
-            if bars:
-                return bars
+        bars = _clean_bars([make_bar_obj(d) for d in raw], ticker) if raw else []
+        lag = _stale_by(bars)
+        if bars and not lag:
+            return bars
+        if bars:
+            # v2.9.3: the bridge served bars ending Friday on Monday night
+            # (2026-09-15 01:20 UTC run scored a whole universe on stale
+            # closes). Prefer yfinance when it is fresher.
+            print(f"[femisagent] WARN: {ticker}: bridge bars stale (last {_bar_date(bars[-1])}, "
+                  f"expected {_expected_last_trading_date()}) — trying yfinance")
         # v2.1: bridge returned empty — yfinance fallback
         yf_bars = _clean_bars(_fetch_bars_via_yfinance(ticker), ticker)
-        if yf_bars:
+        if yf_bars and (not bars or _stale_by(yf_bars) < lag):
             return yf_bars
-        return []
+        return bars or yf_bars or []
     from ib_insync import Stock
     contract = Stock(ticker, exchange, currency)
     try:
