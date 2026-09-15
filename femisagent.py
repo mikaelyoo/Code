@@ -2455,19 +2455,31 @@ def _clean_bars(bars, ticker):
     close and Yahoo's same-day row can both deliver a partially formed last
     bar; one NaN close blanks every indicator and the ticker silently scores
     NEUTRAL/EV 0 with price NaN (2026-09-15 run: 57 of 111 tickers)."""
-    out, dropped = [], 0
+    out, dropped, patched = [], 0, 0
     for b in bars:
         try:
-            vals = (b.open, b.high, b.low, b.close)
+            c = b.close
         except AttributeError:
             dropped += 1
             continue
-        if any(v is None or v != v for v in vals):
-            dropped += 1
+        if c is None or c != c:
+            dropped += 1          # no close → the bar carries no information
             continue
+        # A real close with NaN open/high/low (IBKR after-hours row) is still
+        # the day's close: keep it and patch the missing fields from close
+        # rather than dropping the day and shifting every indicator back one.
+        for f in ("open", "high", "low"):
+            v = getattr(b, f, None)
+            if v is None or v != v:
+                try:
+                    setattr(b, f, c)
+                    patched += 1
+                except AttributeError:
+                    pass
         out.append(b)
-    if dropped:
-        print(f"[femisagent] WARN: {ticker}: dropped {dropped} bar(s) with NaN OHLC")
+    if dropped or patched:
+        print(f"[femisagent] WARN: {ticker}: dropped {dropped} bar(s) with NaN close, "
+              f"patched {patched} NaN O/H/L field(s)")
     return out
 
 
