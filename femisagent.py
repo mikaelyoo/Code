@@ -3012,7 +3012,9 @@ async def run(tickers=None, portfolio_mode=False):
                 # unreal_pct was 0 on every held row. Use the row's price.
                 cf = float(row["price"])
                 row["avg_cost"] = round(ac, 2)
-                row["unreal_pct"] = round((cf - ac) / ac * 100, 1) if ac else 0
+                # sign by position direction: a short gains when price falls
+                _sgn = -1.0 if float(pos["qty"] or 0) < 0 else 1.0
+                row["unreal_pct"] = round(_sgn * (cf - ac) / ac * 100, 1) if ac else 0
             except (TypeError, ValueError, KeyError):
                 row["avg_cost"] = pos.get("avgCost")
                 row["unreal_pct"] = 0
