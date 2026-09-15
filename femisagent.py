@@ -632,6 +632,14 @@ def _fetch_bars_via_yfinance(symbol, days=90):
             return []
         bars = []
         for ts, row in df.iterrows():
+            # v2.9.3: after the close Yahoo can return today's row with NaN
+            # OHLC; one NaN close poisons every rolling stat downstream
+            # ("SPY regime: 20d=+nan%" → bear-regime cap silently off).
+            try:
+                if any(_v != _v for _v in (row["Open"], row["High"], row["Low"], row["Close"])):
+                    continue
+            except KeyError:
+                continue
             try:
                 bars.append(make_bar_obj({
                     "date": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
