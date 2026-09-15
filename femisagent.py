@@ -553,12 +553,32 @@ def _call_capped(fn, cap, what, fallback):
 
 
 BARS_TIMEOUT = float(os.environ.get("FEMISA_BARS_TIMEOUT", "40"))
+# Circuit breaker: after this many consecutive capped/empty bridge bar fetches
+# the bridge is considered wedged (2026-09-15: every call hung 40 s, turning a
+# 90-minute run into a 4-hour one) and the rest of the run goes straight to
+# yfinance. A successful fetch resets the counter.
+BRIDGE_TRIP_AFTER = int(os.environ.get("FEMISA_BRIDGE_TRIP_AFTER", "3"))
+_bridge_fail_streak = 0
+_bridge_tripped = False
 
 
 def fetch_bars_via_bridge(symbol):
     """Wall-clock-capped wrapper (v2.9.3); [] → caller falls back to yfinance."""
-    return _call_capped(lambda: _fetch_bars_via_bridge_inner(symbol), BARS_TIMEOUT,
-                        f"bridge fetch_bars({symbol})", [])
+    global _bridge_fail_streak, _bridge_tripped
+    if _bridge_tripped:
+        return []
+    out = _call_capped(lambda: _fetch_bars_via_bridge_inner(symbol), BARS_TIMEOUT,
+                       f"bridge fetch_bars({symbol})", [])
+    if out:
+        _bridge_fail_streak = 0
+        return out
+    _bridge_fail_streak += 1
+    if _bridge_fail_streak >= BRIDGE_TRIP_AFTER:
+        _bridge_tripped = True
+        print(f"[femisagent] WARN: bridge failed {_bridge_fail_streak}x in a row — "
+              f"BRIDGE TRIPPED, using yfinance for the rest of this run "
+              f"(restart jarvis-bridge and check TWS/IB Gateway)")
+    return []
 
 
 def _fetch_bars_via_bridge_inner(symbol):

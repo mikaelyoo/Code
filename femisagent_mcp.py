@@ -183,7 +183,7 @@ def _running_job() -> dict | None:
     return None
 
 
-SCAN_MAX_MIN = float(os.environ.get("FEMISA_SCAN_MAX_MIN", "45"))
+SCAN_MAX_MIN = float(os.environ.get("FEMISA_SCAN_MAX_MIN", "180"))  # a healthy 110-ticker run is ~90 min
 
 
 def _kill_job(job: dict, reason: str) -> bool:
