@@ -2690,7 +2690,13 @@ async def run(tickers=None, portfolio_mode=False):
         thirteen_f = get_13f_context(sym)
         row["thirteen_f"] = thirteen_f
         if thirteen_f and thirteen_f.get("inst_pct") is not None:
-            inst_pct = thirteen_f["inst_pct"]
+            inst_pct = float(thirteen_f["inst_pct"])
+            # v2.9.3: the 13F feed reports a FRACTION of float (1.01 = 101%,
+            # >1 from float/short double counting), not a percent. Values
+            # like 1.01–1.17 tripped the "<10%" retail-heavy cap on MPWR, ON,
+            # GFS, ENTG, ACLS, ONTO, COHU, VECO (2026-09-15). Normalise.
+            if 0 < inst_pct <= 2.0:
+                inst_pct = round(inst_pct * 100, 1)
             if inst_pct < 10 and row["ev_score"] >= 4:
                 row["ev_score"] = min(row["ev_score"], 3.5)
                 row["verdict"] = "🟢 BUY"
