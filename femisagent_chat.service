@@ -1,0 +1,21 @@
+# /etc/systemd/system/femisagent_chat.service
+# Long-running Telegram bot: agentic LLM interface to femisagent.
+[Unit]
+Description=femisagent Telegram chat bot (Claude-powered)
+After=network-online.target jarvis-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /docker/openclaw-vhii/data/.openclaw/workspace/scripts/femisagent_chat.py
+Restart=on-failure
+RestartSec=30
+User=root
+StandardOutput=append:/var/log/femisagent/chat.log
+StandardError=append:/var/log/femisagent/chat.log
+# Inherit jarvis-bridge env (SUPABASE_*, TELEGRAM_*, ANTHROPIC_API_KEY)
+EnvironmentFile=-/etc/default/jarvis-bridge
+EnvironmentFile=-/etc/femisagent/chat.env
+
+[Install]
+WantedBy=multi-user.target
