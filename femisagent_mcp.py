@@ -301,15 +301,31 @@ def tool_sync_positions(positions: list[dict], source: str = "claude-ibkr-connec
             "note": "Used by scans when the bridge/TWS returns no positions. Pass --portfolio scans (cron does; run_scan does)."}
 
 
-def tool_scan_status(job_id: str | None = None) -> dict:
+def _filter_tiers(summary: dict | None, tiers) -> dict | None:
+    """Keep only the requested tiers in by_tier (counts stay complete). A full
+    111-ticker result exceeds the 32 kB tool-output cap, which truncated the
+    AVOID tier on 2026-09-15."""
+    if not summary or not tiers:
+        return summary
+    want = {t.upper() for t in tiers}
+    s = dict(summary)
+    s["by_tier"] = {k: v for k, v in summary.get("by_tier", {}).items() if k in want}
+    s["tiers_shown"] = sorted(want)
+    return s
+
+
+def tool_scan_status(job_id: str | None = None, tiers: list[str] | None = None) -> dict:
     if not _JOBS:
         run = _load_last_run()
         return {"state": "no jobs in this server process",
-                "last_run": _scan_summary(run) if run else None}
+                "last_run": _filter_tiers(_scan_summary(run), tiers) if run else None}
     job = _JOBS.get(job_id) if job_id else _JOBS[max(_JOBS)]
     if not job:
         return {"error": f"unknown job_id {job_id}", "known": sorted(_JOBS)}
-    return _job_status(job)
+    st = _job_status(job)
+    if "result" in st:
+        st["result"] = _filter_tiers(st["result"], tiers)
+    return st
 
 
 def tool_query_portfolio() -> dict:
@@ -465,7 +481,13 @@ TOOLS_SCHEMA = [
         ),
         inputSchema={
             "type": "object",
-            "properties": {"job_id": {"type": "string"}},
+            "properties": {
+                "job_id": {"type": "string"},
+                "tiers": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only include these tiers in result.by_tier, e.g. ['EXECUTE','BUY'] — a full 110-ticker result overflows the 32 kB tool-output cap",
+                },
+            },
         },
     ),
     Tool(

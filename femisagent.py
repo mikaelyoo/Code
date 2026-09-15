@@ -2450,13 +2450,36 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     return result if result else ["NEUTRAL"]
 
 # ── IBKR data fetch ─────────────────────────────────────────────────────────
+def _clean_bars(bars, ticker):
+    """v2.9.3: drop bars with NaN/None OHLC from ANY source. IBKR after the
+    close and Yahoo's same-day row can both deliver a partially formed last
+    bar; one NaN close blanks every indicator and the ticker silently scores
+    NEUTRAL/EV 0 with price NaN (2026-09-15 run: 57 of 111 tickers)."""
+    out, dropped = [], 0
+    for b in bars:
+        try:
+            vals = (b.open, b.high, b.low, b.close)
+        except AttributeError:
+            dropped += 1
+            continue
+        if any(v is None or v != v for v in vals):
+            dropped += 1
+            continue
+        out.append(b)
+    if dropped:
+        print(f"[femisagent] WARN: {ticker}: dropped {dropped} bar(s) with NaN OHLC")
+    return out
+
+
 async def fetch_bars(ib, ticker, exchange="SMART", currency="USD"):
     if USE_BRIDGE and BRIDGE_TOKEN:
         raw = fetch_bars_via_bridge(ticker)
         if raw:
-            return [make_bar_obj(d) for d in raw]
+            bars = _clean_bars([make_bar_obj(d) for d in raw], ticker)
+            if bars:
+                return bars
         # v2.1: bridge returned empty — yfinance fallback
-        yf_bars = _fetch_bars_via_yfinance(ticker)
+        yf_bars = _clean_bars(_fetch_bars_via_yfinance(ticker), ticker)
         if yf_bars:
             return yf_bars
         return []
@@ -2474,7 +2497,7 @@ async def fetch_bars(ib, ticker, exchange="SMART", currency="USD"):
             formatDate=1,
             keepUpToDate=False,
         )
-        return list(bars)
+        return _clean_bars(list(bars), ticker)
     except Exception:
         return []
 
