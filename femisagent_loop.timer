@@ -1,0 +1,19 @@
+# /etc/systemd/system/femisagent_loop.timer
+# Fire femisagent_loop every 15 min during US market hours (9:30am-4:00pm ET).
+# São Paulo (UTC-3): 10:30-17:00 SP weekdays. We use UTC for systemd.
+# US market: 14:30-21:00 UTC, Mon-Fri.
+[Unit]
+Description=femisagent continuous loop trigger (every 15 min during US market hours)
+
+[Timer]
+# Mon-Fri 14:30-20:45 UTC, every 15 min
+OnCalendar=Mon..Fri *-*-* 14,15,16,17,18,19,20:00/15:00
+# Also run one final scan at 21:00 UTC (market close)
+OnCalendar=Mon..Fri *-*-* 21:00:00
+# Pre-market scan at 13:00 UTC
+OnCalendar=Mon..Fri *-*-* 13:00:00
+Persistent=true
+Unit=femisagent_loop.service
+
+[Install]
+WantedBy=timers.target

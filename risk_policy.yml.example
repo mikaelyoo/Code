@@ -1,0 +1,43 @@
+# /etc/femisagent/risk_policy.yml
+# Copy to /etc/femisagent/risk_policy.yml and edit values.
+# femisagent_rebalance.py reads this on each run.
+
+# IBKR account number
+account: U20889400
+
+# Total NAV in USD — used for % NAV sizing calculations
+nav_estimate_usd: 250000
+
+# ─── Sizing ─────────────────────────────────────────────────────
+# Full-size new entry (EXECUTE tier on watchlist)
+entry_size_pct_full: 2.5
+# Half-size new entry (BUY tier on watchlist)
+entry_size_pct_half: 1.25
+# Trim % when held position is EXECUTE but overweight (>50% of cap)
+trim_pct_execute_overweight: 20
+# Trim % when held position flags AVOID
+trim_pct_avoid: 25
+
+# ─── Risk caps ──────────────────────────────────────────────────
+# Max % NAV in any one single name
+single_name_cap_pct: 8.0
+# Max % NAV per sector
+sector_cap_pct: 35.0
+# Skip new BUYS within N days of an earnings release (TRIMS still allowed)
+earnings_buffer_days: 5
+# Liquidity floor — don't propose orders on names with thinner ADV
+min_avg_daily_volume_usd: 1000000
+
+# ─── Tier thresholds ────────────────────────────────────────────
+# EV threshold to qualify as EXECUTE-tier action
+execute_ev_threshold: 4.0
+# EV threshold to qualify as BUY-tier action
+buy_ev_threshold: 2.0
+# EV below which we trim AVOID positions
+avoid_ev_threshold: -2.0
+
+# ─── Operational ────────────────────────────────────────────────
+# Don't propose more than N orders per run (highest-|EV| wins)
+max_orders_per_run: 30
+# Don't propose orders below $200 dollar value
+min_order_value_usd: 200

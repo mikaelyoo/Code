@@ -1,0 +1,15 @@
+{
+  "_comment": "femisagent TradingView policy. Copy to /etc/femisagent/tv_policy.json and edit. Indicator names must match the 'indicator' field you put in the TradingView alert JSON (uppercased, spaces -> underscores). timeframe uses 1m 5m 15m 1h 4h 1D 1W; '*' = any.",
+  "require_permit": [
+    {"indicator": "TREND", "timeframe": "1D", "states": ["PERMIT", "ENTRY"]}
+  ],
+  "entry_any": [
+    {"indicator": "TRIGGER", "timeframe": "4h", "states": ["ENTRY"]},
+    {"indicator": "TRIGGER", "timeframe": "1h", "states": ["ENTRY"]}
+  ],
+  "exit_any": [
+    {"indicator": "TRIGGER", "timeframe": "*", "states": ["EXIT"]},
+    {"indicator": "TREND", "timeframe": "1D", "states": ["BLOCK"]}
+  ],
+  "max_age_hours": {"1h": 6, "4h": 30, "1D": 80, "1W": 250}
+}

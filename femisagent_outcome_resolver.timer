@@ -1,0 +1,12 @@
+# /etc/systemd/system/femisagent_outcome_resolver.timer
+# Fire outcome resolver nightly at 22:00 UTC (post-close).
+[Unit]
+Description=Nightly femisagent outcome resolver
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 22:00:00
+Persistent=true
+Unit=femisagent_outcome_resolver.service
+
+[Install]
+WantedBy=timers.target
