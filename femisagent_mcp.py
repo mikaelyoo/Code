@@ -272,6 +272,147 @@ def tool_run_scan(tickers: list[str], wait_seconds: int = 45) -> dict:
     return st
 
 
+# ── TradingView webhook (v3.0) ───────────────────────────────────────────────
+# TradingView alerts POST a JSON body to a URL and cannot set headers, so the
+# shared secret travels in the URL path (/tv/<secret>) or the body ("secret").
+# Each alert is normalised and (1) merged into a local cache the scanner reads
+# (/var/lib/femisagent/tv_signals.json) and (2) appended to Supabase
+# femisagent_tv_signals for history.
+import threading
+TV_CACHE = Path(os.environ.get("FEMISA_TV_CACHE", "/var/lib/femisagent/tv_signals.json"))
+TV_SECRET = os.environ.get("FEMISA_TV_SECRET", "").strip()
+_TV_LOCK = threading.Lock()
+_TV_TF = {"1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m", "45": "45m",
+          "60": "1h", "120": "2h", "180": "3h", "240": "4h", "D": "1D", "1D": "1D",
+          "W": "1W", "1W": "1W", "M": "1M", "1M": "1M",
+          "1H": "1h", "2H": "2h", "4H": "4h", "1M": "1M"}
+_TV_STATE = {
+    "PERMIT": "PERMIT", "CAN_TRADE": "PERMIT", "GO": "PERMIT", "GREEN": "PERMIT", "ALLOW": "PERMIT", "OK": "PERMIT",
+    "BLOCK": "BLOCK", "NO_TRADE": "BLOCK", "RED": "BLOCK", "STAND_ASIDE": "BLOCK", "WAIT": "BLOCK", "DENY": "BLOCK",
+    "ENTRY": "ENTRY", "ENTER": "ENTRY", "BUY": "ENTRY", "LONG": "ENTRY", "OPEN": "ENTRY",
+    "EXIT": "EXIT", "SELL": "EXIT", "CLOSE": "EXIT", "TAKE_PROFIT": "EXIT", "STOP": "EXIT",
+}
+
+
+def _tv_norm_tf(v) -> str:
+    s = str(v or "").strip().upper()
+    return _TV_TF.get(s, _TV_TF.get(s.rstrip("S"), s))
+
+
+def _tv_record(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    ticker = str(payload.get("ticker") or payload.get("symbol") or "").strip().upper()
+    if ":" in ticker:                       # "NASDAQ:NVDA" → "NVDA"
+        payload.setdefault("exchange", ticker.split(":")[0])
+        ticker = ticker.split(":")[-1]
+    indicator = str(payload.get("indicator") or payload.get("setup") or "").strip().upper().replace(" ", "_")
+    state_raw = str(payload.get("state") or payload.get("signal") or payload.get("action") or "").strip().upper().replace(" ", "_")
+    if not (ticker and indicator and state_raw):
+        raise ValueError("need ticker, indicator and state")
+    rec = {
+        "ticker": ticker,
+        "exchange": (str(payload.get("exchange") or "").upper() or None),
+        "indicator": indicator,
+        "timeframe": _tv_norm_tf(payload.get("timeframe") or payload.get("interval") or "1D"),
+        "state": _TV_STATE.get(state_raw, state_raw),
+        "state_raw": state_raw,
+        "direction": (str(payload.get("direction") or "").upper() or None),
+        "price": None,
+        "bar_time": str(payload.get("bar_time") or payload.get("time") or "") or None,
+        "message": (str(payload.get("message") or "")[:500] or None),
+        "received_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+    }
+    try:
+        rec["price"] = float(payload.get("price") or payload.get("close")) if payload.get("price") or payload.get("close") else None
+    except (TypeError, ValueError):
+        pass
+    return rec
+
+
+def _tv_store(rec: dict) -> None:
+    with _TV_LOCK:
+        try:
+            cache = json.loads(TV_CACHE.read_text()) if TV_CACHE.exists() else {}
+        except Exception:
+            cache = {}
+        cache.setdefault(rec["ticker"], {})[f"{rec['indicator']}|{rec['timeframe']}"] = rec
+        TV_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TV_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, indent=1))
+        tmp.replace(TV_CACHE)
+
+
+def _tv_supabase_insert(rec: dict, raw: dict) -> None:
+    supa_url = os.environ.get("SUPABASE_URL"); supa_key = os.environ.get("SUPABASE_KEY")
+    if not (supa_url and supa_key):
+        return
+    row = {k: rec[k] for k in ("ticker", "exchange", "indicator", "timeframe", "state",
+                                 "direction", "price", "message")}
+    row["bar_time"] = rec["bar_time"] if rec["bar_time"] and rec["bar_time"][:4].isdigit() else None
+    row["raw"] = raw
+    req = urllib.request.Request(
+        f"{supa_url}/rest/v1/femisagent_tv_signals", data=json.dumps(row).encode(),
+        headers={"apikey": supa_key, "Authorization": f"Bearer {supa_key}",
+                 "Content-Type": "application/json", "Prefer": "return=minimal"},
+        method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        log.warning(f"tv webhook: supabase insert failed: {e}")
+
+
+async def _send_json(send, status: int, obj) -> None:
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": json.dumps(obj).encode()})
+
+
+async def _tv_webhook(scope, receive, send) -> None:
+    import hmac as _hmac
+    if scope.get("method") != "POST":
+        return await _send_json(send, 405, {"error": "POST only"})
+    if not TV_SECRET:
+        return await _send_json(send, 503, {"error": "FEMISA_TV_SECRET not configured on server"})
+    body = b""
+    while True:
+        msg = await receive()
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+    try:
+        payload = json.loads(body.decode("utf-8", "replace") or "{}")
+    except json.JSONDecodeError:
+        return await _send_json(send, 400, {"error": "body is not JSON — set the alert message to the JSON template"})
+    path_secret = scope.get("path", "")[len("/tv/"):] if scope.get("path", "").startswith("/tv/") else ""
+    body_secret = str(payload.get("secret") or "") if isinstance(payload, dict) else ""
+    if not (_hmac.compare_digest(path_secret, TV_SECRET) or _hmac.compare_digest(body_secret, TV_SECRET)):
+        return await _send_json(send, 401, {"error": "bad secret"})
+    if isinstance(payload, dict):
+        payload.pop("secret", None)
+    try:
+        rec = _tv_record(payload)
+    except ValueError as e:
+        return await _send_json(send, 400, {"error": str(e)})
+    _tv_store(rec)
+    threading.Thread(target=_tv_supabase_insert, args=(rec, payload), daemon=True).start()
+    log.info(f"tv webhook: {rec['ticker']} {rec['indicator']}@{rec['timeframe']} = {rec['state']}")
+    return await _send_json(send, 200, {"ok": True, "stored": rec})
+
+
+def tool_query_tv_signals(ticker: str | None = None) -> dict:
+    """Latest TradingView state per (indicator, timeframe) from the local cache."""
+    try:
+        cache = json.loads(TV_CACHE.read_text()) if TV_CACHE.exists() else {}
+    except Exception as e:
+        return {"error": f"cache unreadable: {e}", "path": str(TV_CACHE)}
+    if ticker:
+        return {"ticker": ticker.upper(), "signals": cache.get(ticker.upper(), {}),
+                "webhook_configured": bool(TV_SECRET)}
+    return {"tickers": len(cache), "webhook_configured": bool(TV_SECRET),
+            "latest": {t: list(v.values()) for t, v in list(cache.items())[:40]}}
+
+
 POSITIONS_CACHE = Path(os.environ.get("FEMISA_POSITIONS_CACHE",
                                       "/var/lib/femisagent/positions_cache.json"))
 
@@ -496,6 +637,16 @@ TOOLS_SCHEMA = [
         inputSchema={"type": "object", "properties": {"job_id": {"type": "string"}}},
     ),
     Tool(
+        name="query_tv_signals",
+        description=(
+            "Latest TradingView alert states received by the /tv webhook, per "
+            "ticker → indicator@timeframe → state (PERMIT/BLOCK/ENTRY/EXIT or raw). "
+            "Omit ticker for an overview. The scanner turns these into TV_* flags "
+            "and applies /etc/femisagent/tv_policy.json as a permission gate."
+        ),
+        inputSchema={"type": "object", "properties": {"ticker": {"type": "string"}}},
+    ),
+    Tool(
         name="sync_positions",
         description=(
             "Push the user's current IBKR holdings into the scanner's positions "
@@ -597,6 +748,7 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
         "scan_status": tool_scan_status,
         "cancel_scan": tool_cancel_scan,
         "sync_positions": tool_sync_positions,
+        "query_tv_signals": tool_query_tv_signals,
         "query_portfolio": tool_query_portfolio,
         "query_signal_history": tool_query_signal_history,
         "query_outcomes_by_flag": tool_query_outcomes_by_flag,
@@ -667,6 +819,10 @@ def run_http(host: str, port: int):
 
     async def app(scope, receive, send):
         if scope.get("type") == "http":
+            # TradingView webhook: own auth (secret in path/body), no bearer.
+            if (scope.get("path") or "").startswith("/tv"):
+                await _tv_webhook(scope, receive, send)
+                return
             # Starlette answers POST /mcp with 307 → /mcp/ before any mounted
             # handler runs, so the auth check must sit in front of routing,
             # and the redirect itself is absorbed here.

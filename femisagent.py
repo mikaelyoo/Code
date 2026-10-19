@@ -2450,6 +2450,127 @@ def compute_flags(bars, spy_ret_20d=None, spy_ret_60d=None, spy_60d_dd_pct=None)
     return result if result else ["NEUTRAL"]
 
 # ── IBKR data fetch ─────────────────────────────────────────────────────────
+# ── TradingView webhook signals (v3.0) ───────────────────────────────────────
+# femisagent_mcp.py's /tv webhook writes the latest state per
+# (ticker, indicator, timeframe) to TV_CACHE_PATH. The scanner (1) surfaces each
+# fresh state as a TV_<INDICATOR>_<TF>_<STATE> flag so the live blend can
+# calibrate it, and (2) applies TV_POLICY_PATH as a permission layer:
+#   {
+#     "require_permit": [{"indicator": "TREND", "timeframe": "1D"}],   # ALL must be fresh PERMIT/ENTRY
+#     "entry_any":      [{"indicator": "TRIGGER", "timeframe": "4h"}], # ANY fresh ENTRY → EXECUTE allowed
+#     "exit_any":       [{"indicator": "TRIGGER", "timeframe": "*"}],  # ANY fresh EXIT/BLOCK → TV_EXIT
+#     "max_age_hours":  {"4h": 30, "1D": 80}                           # optional overrides
+#   }
+# No policy file → informational flags only. Missing/stale permit caps EV at
+# 1.5 (WATCH); missing entry caps at 3.5 (BUY); an exit zeroes EV and tags
+# TV_EXIT so the alert dispatcher and rebalance engine see it on held names.
+TV_CACHE_PATH  = os.environ.get("FEMISA_TV_CACHE", "/var/lib/femisagent/tv_signals.json")
+TV_POLICY_PATH = os.environ.get("FEMISA_TV_POLICY", "/etc/femisagent/tv_policy.json")
+TV_MAX_AGE_H = {"1m": 1, "3m": 1, "5m": 2, "15m": 3, "30m": 4, "45m": 5, "1h": 6, "2h": 10,
+                "3h": 14, "4h": 30, "1D": 80, "1W": 250, "1M": 800}
+_tv_cache_mem = None
+_tv_policy_mem = None
+
+
+def _tv_cache():
+    global _tv_cache_mem
+    if _tv_cache_mem is None:
+        try:
+            with open(TV_CACHE_PATH) as f:
+                _tv_cache_mem = json.load(f)
+        except FileNotFoundError:
+            _tv_cache_mem = {}
+        except Exception as e:
+            print(f"[femisagent] WARN: TV cache unreadable ({e})")
+            _tv_cache_mem = {}
+    return _tv_cache_mem
+
+
+def _tv_policy():
+    global _tv_policy_mem
+    if _tv_policy_mem is None:
+        try:
+            with open(TV_POLICY_PATH) as f:
+                _tv_policy_mem = json.load(f) or {}
+            print(f"[femisagent] TV policy loaded: {TV_POLICY_PATH} "
+                  f"(permit={len(_tv_policy_mem.get('require_permit', []))}, "
+                  f"entry={len(_tv_policy_mem.get('entry_any', []))}, "
+                  f"exit={len(_tv_policy_mem.get('exit_any', []))})")
+        except FileNotFoundError:
+            _tv_policy_mem = {}
+        except Exception as e:
+            print(f"[femisagent] WARN: TV policy unreadable ({e}) — TV flags informational only")
+            _tv_policy_mem = {}
+    return _tv_policy_mem
+
+
+def get_tv_signals(symbol):
+    """Fresh-or-stale TradingView states for one ticker."""
+    recs = _tv_cache().get(symbol.upper(), {})
+    max_age = dict(TV_MAX_AGE_H)
+    max_age.update(_tv_policy().get("max_age_hours", {}) or {})
+    out = []
+    for key, r in recs.items():
+        try:
+            ts = datetime.fromisoformat(str(r.get("received_at", "")).replace("Z", "+00:00"))
+            age_h = (datetime.now(ts.tzinfo) - ts).total_seconds() / 3600.0
+        except Exception:
+            age_h = 1e9
+        tf = r.get("timeframe", "1D")
+        out.append({"indicator": r.get("indicator"), "timeframe": tf, "state": r.get("state"),
+                    "direction": r.get("direction"), "price": r.get("price"),
+                    "age_h": round(age_h, 1), "fresh": age_h <= max_age.get(tf, 80)})
+    return out
+
+
+def _tv_match(sig, rule, default_states):
+    if not sig.get("fresh"):
+        return False
+    if str(rule.get("indicator", "*")).upper() not in ("*", str(sig["indicator"]).upper()):
+        return False
+    if str(rule.get("timeframe", "*")) not in ("*", str(sig["timeframe"])):
+        return False
+    states = {s.upper() for s in (rule.get("states") or default_states)}
+    return str(sig["state"]).upper() in states
+
+
+def apply_tv_gate(row, symbol):
+    """Add TV_* flags for fresh states and enforce the TV policy. Returns the
+    signal list for the row (also stored on row['tv'])."""
+    sigs = get_tv_signals(symbol)
+    row["tv"] = sigs
+    for s in sigs:
+        if s["fresh"]:
+            row["all_flags"].append(f"TV_{s['indicator']}_{s['timeframe']}_{s['state']}")
+    pol = _tv_policy()
+    if not pol:
+        return sigs
+    exits = [s for s in sigs for r in pol.get("exit_any", []) if _tv_match(s, r, {"EXIT", "BLOCK"})]
+    if exits:
+        row["all_flags"].append("TV_EXIT")
+        row["tv_exit"] = True
+        if row["ev_score"] > 0:
+            row["ev_score"] = 0.0
+            row["verdict"] = "🟡 WATCH"
+        row["gate"] = row.get("gate") or f"TV_EXIT({exits[0]['indicator']}@{exits[0]['timeframe']})"
+        return sigs
+    missing = [f"{r.get('indicator', '*')}@{r.get('timeframe', '*')}"
+               for r in pol.get("require_permit", [])
+               if not any(_tv_match(s, r, {"PERMIT", "ENTRY"}) for s in sigs)]
+    if missing and row["ev_score"] >= 2:
+        row["ev_score"] = min(row["ev_score"], 1.5)
+        row["verdict"] = "🟡 WATCH"
+        row["gate"] = row.get("gate") or f"TV_NO_PERMIT({','.join(missing)})"
+        return sigs
+    entry_rules = pol.get("entry_any", [])
+    if entry_rules and row["ev_score"] >= 4 and not any(
+            _tv_match(s, r, {"ENTRY", "PERMIT"}) for s in sigs for r in entry_rules):
+        row["ev_score"] = min(row["ev_score"], 3.5)
+        row["verdict"] = "🟢 BUY"
+        row["gate"] = row.get("gate") or "TV_NO_ENTRY"
+    return sigs
+
+
 def _clean_bars(bars, ticker):
     """v2.9.3: drop bars with NaN/None OHLC from ANY source. IBKR after the
     close and Yahoo's same-day row can both deliver a partially formed last
@@ -3000,6 +3121,13 @@ async def run(tickers=None, portfolio_mode=False):
             row["verdict"] = verdict_from_ev(_net_all)
             _worst = min(row["all_flags"], key=lambda f: ev_score(f) if f != primary else 0)
             row["gate"] = row.get("gate") or f"NET_EV({_worst} {ev_score(_worst):+.1f})"
+
+        # v3.0 — TradingView permission layer (after net-EV so TV flags are
+        # recorded for calibration, and the policy caps apply last).
+        try:
+            apply_tv_gate(row, sym)
+        except Exception as e:
+            print(f"[femisagent] WARN: TV gate failed for {sym}: {e}")
 
         if sym in portfolio_data:
             pos = portfolio_data[sym]

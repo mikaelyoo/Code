@@ -25,7 +25,7 @@ for f in femisagent.py femisagent_backtest.py femisa_sync.sh \
          femisagent_outcome_logger.py femisagent_outcome_resolver.py \
          femisagent_chat.py \
          femisagent_rebalance.py risk_policy.yml.example \
-         femisagent_mcp.py; do
+         femisagent_mcp.py tv_policy.json.example femisagent_TV_SETUP.md; do
   log "Pulling $f"
   if curl -fsSL --max-time 30 -o "/tmp/__inst_$f" "${REPO_RAW}/${f}"; then
     if [[ "$f" == *.py ]]; then
